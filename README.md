@@ -237,13 +237,13 @@ Releases are handled by Buildkite, not GitHub Actions.
    pushed tag as the Buildkite build commit/ref as shown above.
 
 On `v*` tags, Buildkite installs Go 1.25.3 with the `setup-go` plugin, runs
-tests, builds precompiled gh extension binaries, mints a one-hour GitHub App
-installation token scoped to `buildkite-solutions/gh-concurrency` with
-`contents: write`, uploads the GitHub Release assets, and publishes a multi-arch
-image to GHCR with `GHCR_TOKEN`. For manually triggered builds, `RELEASE_TAG`
-can be used instead of Buildkite's native `build.tag` value. The pipeline uses a
-hosted agent cache volume at `.buildkite/cache-volume` to keep toolchain and Go
-caches warm between builds.
+tests, validates the GitHub App release credentials, builds precompiled gh
+extension binaries, mints a one-hour GitHub App installation token scoped to
+`buildkite-solutions/gh-concurrency` with `contents: write`, uploads the GitHub
+Release assets, and publishes a multi-arch image to GHCR with `GHCR_TOKEN`. For
+manually triggered builds, `RELEASE_TAG` can be used instead of Buildkite's
+native `build.tag` value. The pipeline uses a hosted agent cache volume at
+`.buildkite/cache-volume` to keep toolchain and Go caches warm between builds.
 
 ## Security Model
 
