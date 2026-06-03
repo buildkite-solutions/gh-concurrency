@@ -203,13 +203,42 @@ Releases are handled by Buildkite, not GitHub Actions.
    git push origin v1.0.0
    ```
 
+7. Trigger the Buildkite build manually:
+
+   Keep the Buildkite pipeline's branch filter as `main pb/*`. For a manual
+   release build, use `main` as the branch so the branch filter passes, and use
+   the pushed tag as the commit/ref to check out.
+
+   In the Buildkite UI, click New Build and set:
+
+   - Branch: `main`
+   - Commit: `v1.0.0`
+   - Message: `Release v1.0.0`
+   - Environment variable: `RELEASE_TAG=v1.0.0`
+
+   Or with the Buildkite CLI:
+
+   ```bash
+   bk build create \
+     --pipeline buildkite-solutions/gh-concurrency \
+     --branch main \
+     --commit v1.0.0 \
+     --message "Release v1.0.0" \
+     --env RELEASE_TAG=v1.0.0
+   ```
+
+   Do not set the Buildkite branch to `v1.0.0` unless you also add `v*` to the
+   pipeline branch filter. This release path intentionally keeps the branch as
+   `main` and uses `RELEASE_TAG` as the manual release gate.
+
 On `v*` tags, Buildkite installs Go 1.25.3 with the `setup-go` plugin, runs
 tests, builds precompiled gh extension binaries, mints a one-hour GitHub App
 installation token scoped to `buildkite-solutions/gh-concurrency` with
 `contents: write`, uploads the GitHub Release assets, and publishes a multi-arch
-image to GHCR with `GHCR_TOKEN`. The pipeline uses a hosted agent cache volume
-at `.buildkite/cache-volume` to keep toolchain and Go caches warm between
-builds.
+image to GHCR with `GHCR_TOKEN`. For manually triggered builds, `RELEASE_TAG`
+can be used instead of Buildkite's native `build.tag` value. The pipeline uses a
+hosted agent cache volume at `.buildkite/cache-volume` to keep toolchain and Go
+caches warm between builds.
 
 ## Security Model
 

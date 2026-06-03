@@ -1,5 +1,8 @@
 cache: ".buildkite/cache-volume"
 
+env:
+  BUILDKITE_GIT_FETCH_FLAGS: "-v --prune --tags"
+
 steps:
   - label: ":go: Test"
     key: "test"
@@ -11,7 +14,7 @@ steps:
   - label: ":package: Build gh extension binaries"
     key: "release-binaries"
     depends_on: "test"
-    if: "build.tag =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+/"
+    if: "build.tag =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+/ || build.env('RELEASE_TAG') =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+/"
     plugins:
       - setup-go#v0.1.0:
           version: 1.25.3
@@ -22,7 +25,7 @@ steps:
   - label: ":docker: Publish GHCR image"
     key: "docker"
     depends_on: "test"
-    if: "build.tag =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+/"
+    if: "build.tag =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+/ || build.env('RELEASE_TAG') =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+/"
     secrets:
       - GHCR_USERNAME
       - GHCR_TOKEN
@@ -33,7 +36,7 @@ steps:
 
   - label: ":github: Publish GitHub release"
     depends_on: "release-binaries"
-    if: "build.tag =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+/"
+    if: "build.tag =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+/ || build.env('RELEASE_TAG') =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+/"
     secrets:
       - GITHUB_APP_CLIENT_ID
       - GITHUB_APP_PRIVATE_KEY_B64

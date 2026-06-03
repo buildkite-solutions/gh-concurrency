@@ -52,9 +52,9 @@ func main() {
 }
 
 func run() error {
-	version := firstEnv("VERSION", "BUILDKITE_TAG")
+	version := firstEnv("VERSION", "RELEASE_TAG", "BUILDKITE_TAG")
 	if version == "" {
-		return errors.New("VERSION or BUILDKITE_TAG is required")
+		return errors.New("VERSION, RELEASE_TAG, or BUILDKITE_TAG is required")
 	}
 	repo, err := releaseRepo()
 	if err != nil {

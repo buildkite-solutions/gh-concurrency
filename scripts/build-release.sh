@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version="${1:-${BUILDKITE_TAG:-}}"
+version="${1:-${RELEASE_TAG:-${BUILDKITE_TAG:-}}}"
 if [[ -z "${version}" ]]; then
-  echo "usage: scripts/build-release.sh v1.0.0" >&2
+  echo "usage: scripts/build-release.sh v1.0.0 (or set RELEASE_TAG/BUILDKITE_TAG)" >&2
   exit 2
 fi
 
