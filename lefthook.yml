@@ -1,0 +1,4 @@
+pre-commit:
+  commands:
+    trufflehog:
+      run: trufflehog filesystem . --fail --no-update --results=verified,unknown
