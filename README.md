@@ -231,6 +231,11 @@ Releases are handled by Buildkite, not GitHub Actions.
    pipeline branch filter. This release path intentionally keeps the branch as
    `main` and uses `RELEASE_TAG` as the manual release gate.
 
+   Do not set `BUILDKITE_GIT_FETCH_FLAGS` in `.buildkite/pipeline.yml` to force
+   tag fetching. `BUILDKITE_*` variables are protected runtime variables, so
+   Buildkite will ignore pipeline-level overrides. For manual releases, use the
+   pushed tag as the Buildkite build commit/ref as shown above.
+
 On `v*` tags, Buildkite installs Go 1.25.3 with the `setup-go` plugin, runs
 tests, builds precompiled gh extension binaries, mints a one-hour GitHub App
 installation token scoped to `buildkite-solutions/gh-concurrency` with

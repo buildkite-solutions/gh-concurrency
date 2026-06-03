@@ -1,13 +1,10 @@
 cache: ".buildkite/cache-volume"
 
-env:
-  BUILDKITE_GIT_FETCH_FLAGS: "-v --prune --tags"
-
 steps:
   - label: ":go: Test"
     key: "test"
     plugins:
-      - setup-go#v0.1.0:
+      - setup-go#daa7af945245588f85b76ba7fe0a9af3d87dbf91:
           version: 1.25.3
     command: "make test"
 
@@ -16,7 +13,7 @@ steps:
     depends_on: "test"
     if: "build.tag =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+/ || build.env('RELEASE_TAG') =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+/"
     plugins:
-      - setup-go#v0.1.0:
+      - setup-go#daa7af945245588f85b76ba7fe0a9af3d87dbf91:
           version: 1.25.3
     command:
       - "scripts/build-release.sh"
@@ -30,7 +27,7 @@ steps:
       - GHCR_USERNAME
       - GHCR_TOKEN
     plugins:
-      - setup-go#v0.1.0:
+      - setup-go#daa7af945245588f85b76ba7fe0a9af3d87dbf91:
           version: 1.25.3
     command: "scripts/publish-docker.sh"
 
@@ -41,7 +38,7 @@ steps:
       - GITHUB_APP_CLIENT_ID
       - GITHUB_APP_PRIVATE_KEY_B64
     plugins:
-      - setup-go#v0.1.0:
+      - setup-go#daa7af945245588f85b76ba7fe0a9af3d87dbf91:
           version: 1.25.3
     command:
       - "buildkite-agent artifact download \"dist/*\" ."
