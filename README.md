@@ -14,9 +14,15 @@ The tool is a dependency-free Go binary. It makes authenticated `GET` requests
 only, never logs your token, and works either as a GitHub CLI extension or as a
 container image.
 
-## Install
+## For Users: Run The Estimator
 
-### GitHub CLI extension
+This section is for people who want to install `gh-concurrency`, point it at
+their GitHub repositories or organizations, and read the resulting concurrency
+profile.
+
+### Install
+
+#### GitHub CLI extension
 
 ```bash
 gh extension install buildkite-solutions/gh-concurrency
@@ -26,7 +32,7 @@ gh concurrency --org owner --since 2025-05-01
 The extension uses your existing `gh auth login` session when no token is set.
 You can also provide `GITHUB_TOKEN`, `GH_TOKEN`, or `--token`.
 
-### Docker
+#### Docker
 
 ```bash
 export GITHUB_TOKEN=ghp_xxx
@@ -35,6 +41,8 @@ docker run --rm -e GITHUB_TOKEN \
   ghcr.io/buildkite-solutions/gh-concurrency:latest \
   --org owner --since 2025-05-01
 ```
+
+### Choose Targets
 
 Scan one repo, one org, several orgs, or a curated cross-org repo list. Every
 target is pooled into one concurrency profile:
@@ -74,7 +82,7 @@ Organization scans use `--repo-type all` by default. Use `--repo-type sources`
 to exclude forks, or `public`, `private`, `forks`, or `member` when you need a
 narrower profile.
 
-## GitHub Enterprise Server
+### GitHub Enterprise Server
 
 Point the tool at your instance's API base:
 
@@ -97,7 +105,7 @@ docker run --rm \
   --org owner --since 2025-05-01
 ```
 
-## Token Scopes
+### Token Scopes
 
 Use a fine-grained personal access token with read-only access:
 
@@ -111,7 +119,7 @@ For organization-wide scans, the token must be able to list the organization's
 repositories and read Actions metadata for each repository you want included.
 Repositories that are not found or not readable are skipped with a warning.
 
-## Reading The Output
+### Reading The Output
 
 ```text
 Peak concurrency:     42
@@ -134,7 +142,26 @@ briefly before each request by default (`--request-delay-ms 100`), honors
 `Retry-After`, waits for primary rate-limit reset windows, and backs off for
 secondary rate-limit responses.
 
-## Build
+### Security Model
+
+- Read-only: authenticated `GET` requests only, scoped to the configured GitHub
+  API host.
+- The token is read from env, `--token`, or `gh auth token`; it is never written
+  to disk or logged.
+- No telemetry and no third-party API calls.
+- The Docker image runs a static Go binary as UID `10001`.
+- The core implementation is small enough to audit in one sitting.
+
+Customers can run it themselves and share the JSON output. They never need to
+share their GitHub token.
+
+## For Maintainers: Develop, Build, And Release
+
+This section is for people working on this repository: local development,
+packaging, Docker images, GitHub Release assets, and Buildkite release
+automation.
+
+### Build
 
 Requirements:
 
@@ -162,7 +189,7 @@ make release-binaries VERSION=v1.0.0
 ls dist/
 ```
 
-## Release
+### Release
 
 Releases are handled by Buildkite, not GitHub Actions.
 
@@ -279,19 +306,6 @@ Release assets, and publishes a multi-arch image to GHCR with `GHCR_TOKEN`. For
 manually triggered builds, `RELEASE_TAG` can be used instead of Buildkite's
 native `build.tag` value. The pipeline uses a hosted agent cache volume at
 `.buildkite/cache-volume` to keep toolchain and Go caches warm between builds.
-
-## Security Model
-
-- Read-only: authenticated `GET` requests only, scoped to the configured GitHub
-  API host.
-- The token is read from env, `--token`, or `gh auth token`; it is never written
-  to disk or logged.
-- No telemetry and no third-party API calls.
-- The Docker image runs a static Go binary as UID `10001`.
-- The core implementation is small enough to audit in one sitting.
-
-Customers can run it themselves and share the JSON output. They never need to
-share their GitHub token.
 
 ## License
 
