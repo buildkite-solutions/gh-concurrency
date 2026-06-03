@@ -136,11 +136,22 @@ p95 concurrency:      18
 - Queue-time warnings mean measured concurrency is probably a floor. If jobs
   waited in GitHub's queue, true demand was higher than observed concurrency.
 
-Use `--format json` for machine-readable output and `--verbose` for progress
-and rate-limit logging on stderr. The tool runs requests sequentially, sleeps
-briefly before each request by default (`--request-delay-ms 100`), honors
-`Retry-After`, waits for primary rate-limit reset windows, and backs off for
-secondary rate-limit responses.
+Use `--format json` for machine-readable output. Progress and diagnostics are
+written to stderr so they do not corrupt JSON:
+
+```bash
+# Show target resolution and a repo-by-repo progress bar.
+gh concurrency --org owner --since 2025-05-01 --verbose
+
+# Add exact GitHub API GET/page/rate-limit diagnostics.
+gh concurrency --org owner --since 2025-05-01 --debug
+```
+
+`-v` is an alias for `--verbose`; `-d` is an alias for `--debug`. Debug mode
+implies verbose mode. The tool runs requests sequentially, sleeps briefly
+before each request by default (`--request-delay-ms 100`), honors `Retry-After`,
+waits for primary rate-limit reset windows, and backs off for secondary
+rate-limit responses.
 
 ### Security Model
 
