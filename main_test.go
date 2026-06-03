@@ -202,6 +202,99 @@ func TestPrintTextIncludesRunTime(t *testing.T) {
 	}
 }
 
+func TestRunnerPools(t *testing.T) {
+	records := []record{
+		{
+			Repo:       "o/api",
+			Start:      dt("10:00:00"),
+			End:        dt("10:10:00"),
+			OS:         "linux",
+			SelfHosted: false,
+		},
+		{
+			Repo:       "o/web",
+			Start:      dt("10:05:00"),
+			End:        dt("10:15:00"),
+			OS:         "linux",
+			SelfHosted: false,
+		},
+		{
+			Repo:            "o/api",
+			Start:           dt("10:00:00"),
+			End:             dt("10:08:00"),
+			OS:              "linux",
+			SelfHosted:      true,
+			Labels:          []string{"self-hosted", "linux", "x64", "blacksmith-2vcpu-ubuntu-2404"},
+			RunnerGroupName: "Default",
+		},
+		{
+			Repo:            "o/web",
+			Start:           dt("10:01:00"),
+			End:             dt("10:09:00"),
+			OS:              "linux",
+			SelfHosted:      true,
+			Labels:          []string{"self-hosted", "linux", "x64", "blacksmith-2vcpu-ubuntu-2404"},
+			RunnerGroupName: "Default",
+		},
+		{
+			Repo:            "o/mobile",
+			Start:           dt("10:02:00"),
+			End:             dt("10:10:00"),
+			OS:              "windows",
+			SelfHosted:      true,
+			Labels:          []string{"self-hosted", "windows", "x64", "blacksmith-2vcpu-windows-2022"},
+			RunnerGroupName: "Default",
+		},
+	}
+
+	got := runnerPools(records)
+	if len(got) != 2 {
+		t.Fatalf("runnerPools returned %d pools, want 2: %#v", len(got), got)
+	}
+	if got[0].Name != "self-hosted/blacksmith" || got[0].PeakConcurrency != 3 || got[0].Jobs != 3 {
+		t.Fatalf("top pool = %#v, want blacksmith peak 3 jobs 3", got[0])
+	}
+	if got[0].PercentileConcurrency["p95"] != 3 {
+		t.Fatalf("blacksmith p95 = %d, want 3", got[0].PercentileConcurrency["p95"])
+	}
+	if got[1].Name != "GitHub-hosted/linux" || got[1].PeakConcurrency != 2 || got[1].Jobs != 2 {
+		t.Fatalf("second pool = %#v, want GitHub-hosted/linux peak 2 jobs 2", got[1])
+	}
+}
+
+func TestPrintTextIncludesRunnerPools(t *testing.T) {
+	rep := report{
+		Version:               "test",
+		Parameters:            parameters{Repos: []string{"o/r"}, RepositoryCount: 1, Since: "2025-05-01", BaseURL: defaultBaseURL},
+		PercentileConcurrency: map[string]int{"p50": 1, "p90": 1, "p95": 1, "p99": 1},
+		RunnerPools: []runnerPool{
+			{Name: "self-hosted/blacksmith", Jobs: 4120, PeakConcurrency: 48, PercentileConcurrency: map[string]int{"p95": 30}},
+		},
+	}
+
+	var out bytes.Buffer
+	printText(&out, rep)
+	text := out.String()
+	if !strings.Contains(text, "Runner pools:") {
+		t.Fatalf("output missing Runner pools section:\n%s", text)
+	}
+	if !strings.Contains(text, "self-hosted/blacksmith") || !strings.Contains(text, "4,120 jobs") {
+		t.Fatalf("output missing runner pool details:\n%s", text)
+	}
+}
+
+func TestClassifyRunnerPoolFallbacks(t *testing.T) {
+	unknownSelfHosted := classifyRunnerPool(record{SelfHosted: true, OS: "linux"})
+	if unknownSelfHosted.name != "self-hosted/unknown" {
+		t.Fatalf("self-hosted fallback = %q, want self-hosted/unknown", unknownSelfHosted.name)
+	}
+
+	unknownGitHubHosted := classifyRunnerPool(record{})
+	if unknownGitHubHosted.name != "GitHub-hosted/unknown" {
+		t.Fatalf("github-hosted fallback = %q, want GitHub-hosted/unknown", unknownGitHubHosted.name)
+	}
+}
+
 func TestNextLinkPresent(t *testing.T) {
 	header := `<https://api.github.com/x?page=2>; rel="next", <https://api.github.com/x?page=9>; rel="last"`
 	got := nextLink(header)
@@ -336,20 +429,24 @@ func TestPaginationAndCollectionOfflineReplay(t *testing.T) {
 		"/repos/o/r/actions/runs/1/jobs": {
 			body: map[string]any{"jobs": []map[string]any{
 				{
-					"started_at":   "2025-05-01T10:00:00Z",
-					"completed_at": "2025-05-01T10:05:00Z",
-					"created_at":   "2025-05-01T09:59:00Z",
-					"labels":       []string{"ubuntu-latest"},
+					"started_at":        "2025-05-01T10:00:00Z",
+					"completed_at":      "2025-05-01T10:05:00Z",
+					"created_at":        "2025-05-01T09:59:00Z",
+					"labels":            []string{"ubuntu-latest"},
+					"runner_name":       "GitHub Actions 1",
+					"runner_group_name": "GitHub Actions",
 				},
 			}},
 		},
 		"/repos/o/r/actions/runs/2/jobs": {
 			body: map[string]any{"jobs": []map[string]any{
 				{
-					"started_at":   "2025-05-01T10:02:00Z",
-					"completed_at": "2025-05-01T10:08:00Z",
-					"created_at":   "2025-05-01T10:02:00Z",
-					"labels":       []string{"windows-latest"},
+					"started_at":        "2025-05-01T10:02:00Z",
+					"completed_at":      "2025-05-01T10:08:00Z",
+					"created_at":        "2025-05-01T10:02:00Z",
+					"labels":            []string{"self-hosted", "windows", "x64"},
+					"runner_name":       "blacksmith-1",
+					"runner_group_name": "blacksmith",
 				},
 				{
 					"started_at":   nil,
@@ -376,6 +473,9 @@ func TestPaginationAndCollectionOfflineReplay(t *testing.T) {
 	}
 	if !oses["linux"] || !oses["windows"] {
 		t.Fatalf("OSes = %v, want linux and windows", oses)
+	}
+	if records[1].RunnerName != "blacksmith-1" || records[1].RunnerGroupName != "blacksmith" || !records[1].SelfHosted {
+		t.Fatalf("runner metadata = %#v, want self-hosted blacksmith runner", records[1])
 	}
 	peak, _ := concurrencyProfile([][2]time.Time{
 		{records[0].Start, records[0].End},

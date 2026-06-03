@@ -806,19 +806,24 @@ type workflowRun struct {
 }
 
 type workflowJob struct {
-	StartedAt   string   `json:"started_at"`
-	CompletedAt string   `json:"completed_at"`
-	CreatedAt   string   `json:"created_at"`
-	Labels      []string `json:"labels"`
+	StartedAt       string   `json:"started_at"`
+	CompletedAt     string   `json:"completed_at"`
+	CreatedAt       string   `json:"created_at"`
+	Labels          []string `json:"labels"`
+	RunnerName      string   `json:"runner_name"`
+	RunnerGroupName string   `json:"runner_group_name"`
 }
 
 type record struct {
-	Repo         string
-	Start        time.Time
-	End          time.Time
-	QueueSeconds *float64
-	OS           string
-	SelfHosted   bool
+	Repo            string
+	Start           time.Time
+	End             time.Time
+	QueueSeconds    *float64
+	OS              string
+	SelfHosted      bool
+	Labels          []string
+	RunnerName      string
+	RunnerGroupName string
 }
 
 func collectJobs(client *githubClient, repo, since, until string) ([]record, error) {
@@ -896,12 +901,15 @@ func normalizeJob(job workflowJob, repo string) (*record, error) {
 	}
 
 	return &record{
-		Repo:         repo,
-		Start:        start,
-		End:          end,
-		QueueSeconds: queueSeconds,
-		OS:           inferOS(job.Labels),
-		SelfHosted:   isSelfHosted(job.Labels),
+		Repo:            repo,
+		Start:           start,
+		End:             end,
+		QueueSeconds:    queueSeconds,
+		OS:              inferOS(job.Labels),
+		SelfHosted:      isSelfHosted(job.Labels),
+		Labels:          append([]string{}, job.Labels...),
+		RunnerName:      strings.TrimSpace(job.RunnerName),
+		RunnerGroupName: strings.TrimSpace(job.RunnerGroupName),
 	}, nil
 }
 
@@ -1030,6 +1038,135 @@ func billableMinutes(records []record) map[string]billableSlot {
 	return out
 }
 
+type runnerPool struct {
+	Name                  string         `json:"name"`
+	Jobs                  int            `json:"jobs"`
+	BusyHours             float64        `json:"busy_hours"`
+	PeakConcurrency       int            `json:"peak_concurrency"`
+	PercentileConcurrency map[string]int `json:"percentile_concurrency"`
+	GitHubHosted          bool           `json:"github_hosted"`
+	SelfHosted            bool           `json:"self_hosted"`
+	OS                    string         `json:"os,omitempty"`
+	RunnerGroupName       string         `json:"runner_group_name,omitempty"`
+}
+
+type runnerPoolKey struct {
+	name            string
+	gitHubHosted    bool
+	selfHosted      bool
+	osName          string
+	runnerGroupName string
+}
+
+func runnerPools(records []record) []runnerPool {
+	grouped := map[runnerPoolKey][]record{}
+	for _, rec := range records {
+		key := classifyRunnerPool(rec)
+		grouped[key] = append(grouped[key], rec)
+	}
+
+	pools := make([]runnerPool, 0, len(grouped))
+	for key, poolRecords := range grouped {
+		intervals := make([][2]time.Time, 0, len(poolRecords))
+		for _, rec := range poolRecords {
+			intervals = append(intervals, [2]time.Time{rec.Start, rec.End})
+		}
+		peak, profile := concurrencyProfile(intervals)
+		pct := percentiles(profile, []int{50, 90, 95, 99})
+		busySeconds := 0.0
+		for _, seconds := range profile {
+			busySeconds += seconds
+		}
+
+		pools = append(pools, runnerPool{
+			Name:                  key.name,
+			Jobs:                  len(poolRecords),
+			BusyHours:             math.Round((busySeconds/3600.0)*100) / 100,
+			PeakConcurrency:       peak,
+			PercentileConcurrency: map[string]int{"p50": pct[50], "p90": pct[90], "p95": pct[95], "p99": pct[99]},
+			GitHubHosted:          key.gitHubHosted,
+			SelfHosted:            key.selfHosted,
+			OS:                    key.osName,
+			RunnerGroupName:       key.runnerGroupName,
+		})
+	}
+
+	sort.Slice(pools, func(i, j int) bool {
+		if pools[i].PeakConcurrency != pools[j].PeakConcurrency {
+			return pools[i].PeakConcurrency > pools[j].PeakConcurrency
+		}
+		if pools[i].Jobs != pools[j].Jobs {
+			return pools[i].Jobs > pools[j].Jobs
+		}
+		return strings.ToLower(pools[i].Name) < strings.ToLower(pools[j].Name)
+	})
+	return pools
+}
+
+func classifyRunnerPool(rec record) runnerPoolKey {
+	osName := rec.OS
+	if osName == "" {
+		osName = "unknown"
+	}
+	if !rec.SelfHosted {
+		return runnerPoolKey{
+			name:         "GitHub-hosted/" + osName,
+			gitHubHosted: true,
+			osName:       osName,
+		}
+	}
+
+	groupName := runnerGroupPoolName(rec.RunnerGroupName)
+	if groupName == "" {
+		groupName = runnerPoolLabelHint(rec.Labels)
+	}
+	if groupName == "" {
+		groupName = "unknown"
+	}
+	return runnerPoolKey{
+		name:            "self-hosted/" + groupName,
+		selfHosted:      true,
+		runnerGroupName: groupName,
+	}
+}
+
+func runnerGroupPoolName(groupName string) string {
+	groupName = strings.TrimSpace(groupName)
+	if groupName == "" || strings.EqualFold(groupName, "default") {
+		return ""
+	}
+	return groupName
+}
+
+func runnerPoolLabelHint(labels []string) string {
+	for _, label := range labels {
+		trimmed := strings.TrimSpace(label)
+		normalized := strings.ToLower(trimmed)
+		if normalized == "" || isGenericRunnerLabel(normalized) {
+			continue
+		}
+		switch {
+		case normalized == "blacksmith" || strings.HasPrefix(normalized, "blacksmith-"):
+			return "blacksmith"
+		case normalized == "runs-on" || strings.HasPrefix(normalized, "runs-on-") || strings.HasPrefix(normalized, "runson-"):
+			return "runs-on"
+		case normalized == "arc" || strings.HasPrefix(normalized, "arc-") || strings.Contains(normalized, "actions-runner-controller"):
+			return "arc"
+		default:
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func isGenericRunnerLabel(label string) bool {
+	switch label {
+	case "self-hosted", "linux", "windows", "macos", "mac", "x64", "x86", "x86_64", "amd64", "arm", "arm64", "aarch64", "ubuntu", "ubuntu-latest", "default":
+		return true
+	}
+	return strings.HasPrefix(label, "ubuntu-")
+}
+
 type queueStats struct {
 	Count   int     `json:"count"`
 	MedianS float64 `json:"median_s"`
@@ -1097,6 +1234,7 @@ type report struct {
 	BusyHours               float64                 `json:"busy_hours"`
 	PeakConcurrency         int                     `json:"peak_concurrency"`
 	PercentileConcurrency   map[string]int          `json:"percentile_concurrency"`
+	RunnerPools             []runnerPool            `json:"runner_pools"`
 	BillableMinutesEstimate map[string]billableSlot `json:"billable_minutes_estimate"`
 	QueueSeconds            *queueStats             `json:"queue_seconds"`
 	Warnings                []string                `json:"warnings"`
@@ -1134,6 +1272,7 @@ func buildReport(records []record, cfg config, runtime time.Duration) report {
 		BusyHours:               math.Round((busySeconds/3600.0)*100) / 100,
 		PeakConcurrency:         peak,
 		PercentileConcurrency:   map[string]int{"p50": pct[50], "p90": pct[90], "p95": pct[95], "p99": pct[99]},
+		RunnerPools:             runnerPools(records),
 		BillableMinutesEstimate: billableMinutes(records),
 		QueueSeconds:            qstats,
 		Warnings:                detectWarnings(peak, pct, qstats),
@@ -1180,6 +1319,20 @@ func printText(out io.Writer, rep report) {
 	fmt.Fprintf(out, "Peak concurrency:     %d\n", rep.PeakConcurrency)
 	for _, key := range []string{"p50", "p90", "p95", "p99"} {
 		fmt.Fprintf(out, "%s concurrency:       %d\n", key, rep.PercentileConcurrency[key])
+	}
+
+	if len(rep.RunnerPools) > 0 {
+		fmt.Fprintln(out, "\nRunner pools:")
+		for _, pool := range rep.RunnerPools {
+			fmt.Fprintf(
+				out,
+				"  %-28s peak %4d  p95 %4d  %8s jobs\n",
+				pool.Name,
+				pool.PeakConcurrency,
+				pool.PercentileConcurrency["p95"],
+				comma(pool.Jobs),
+			)
+		}
 	}
 
 	if len(rep.BillableMinutesEstimate) > 0 {
