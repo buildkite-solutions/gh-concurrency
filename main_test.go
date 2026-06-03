@@ -5,6 +5,8 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -194,6 +196,68 @@ func TestNextLinkEmpty(t *testing.T) {
 	}
 }
 
+func TestParseListFile(t *testing.T) {
+	got := parseListFile(`
+# comments are ignored
+buildkite-solutions/gh-concurrency, buildkite-solutions/another
+other-org/repo # inline comment
+
+`)
+	want := []string{
+		"buildkite-solutions/gh-concurrency",
+		"buildkite-solutions/another",
+		"other-org/repo",
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("parseListFile = %v, want %v", got, want)
+	}
+}
+
+func TestResolveTargetReposExpandsOrgsAndFiles(t *testing.T) {
+	dir := t.TempDir()
+	repoFile := filepath.Join(dir, "repos.txt")
+	orgFile := filepath.Join(dir, "orgs.txt")
+	if err := os.WriteFile(repoFile, []byte("file-org/file-repo\nacme/api\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(orgFile, []byte("other\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	responses := map[string]fakeResponse{
+		"/orgs/acme/repos": {
+			body: []map[string]any{
+				{"full_name": "acme/api"},
+				{"full_name": "acme/web"},
+				{"full_name": "acme/disabled", "disabled": true},
+			},
+		},
+		"/orgs/other/repos": {
+			body: []map[string]any{
+				{"full_name": "other/cli"},
+			},
+		},
+	}
+	client := newGitHubClient("https://api.github.com", "tok", 1, false)
+	client.httpClient = &http.Client{Transport: fakeTransport{responses: responses}}
+	client.sleep = func(time.Duration) {}
+
+	got, err := resolveTargetRepos(client, config{
+		repos:     []string{"explicit/repo"},
+		orgs:      []string{"acme"},
+		repoFiles: []string{repoFile},
+		orgFiles:  []string{orgFile},
+		repoType:  "all",
+	}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"acme/api", "acme/web", "explicit/repo", "file-org/file-repo", "other/cli"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("resolveTargetRepos = %v, want %v", got, want)
+	}
+}
+
 func TestPaginationAndCollectionOfflineReplay(t *testing.T) {
 	responses := map[string]fakeResponse{
 		"/repos/o/r/actions/runs": {
@@ -252,6 +316,36 @@ func TestPaginationAndCollectionOfflineReplay(t *testing.T) {
 	}
 }
 
+func TestSecondaryRateLimitBackoffRetries(t *testing.T) {
+	calls := 0
+	var sleeps []time.Duration
+	client := newGitHubClient("https://api.github.com", "tok", 2, false)
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if calls == 1 {
+			return fakeHTTPResponse(http.StatusForbidden, "403 Forbidden", `{"message":"You have exceeded a secondary rate limit"}`, nil), nil
+		}
+		return fakeHTTPResponse(http.StatusOK, "200 OK", `{"ok":true}`, nil), nil
+	})}
+	client.sleep = func(d time.Duration) {
+		sleeps = append(sleeps, d)
+	}
+
+	body, _, err := client.request("https://api.github.com/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(body)) != `{"ok":true}` {
+		t.Fatalf("body = %s", body)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2", calls)
+	}
+	if len(sleeps) != 1 || sleeps[0] < time.Minute {
+		t.Fatalf("sleeps = %v, want one secondary backoff >= 1m", sleeps)
+	}
+}
+
 type fakeResponse struct {
 	body any
 	link string
@@ -264,12 +358,7 @@ type fakeTransport struct {
 func (t fakeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, ok := t.responses[req.URL.Path]
 	if !ok {
-		return &http.Response{
-			StatusCode: http.StatusNotFound,
-			Status:     "404 Not Found",
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader(`{"message":"missing"}`)),
-		}, nil
+		return fakeHTTPResponse(http.StatusNotFound, "404 Not Found", `{"message":"missing"}`, nil), nil
 	}
 	data, err := json.Marshal(resp.body)
 	if err != nil {
@@ -279,10 +368,23 @@ func (t fakeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if resp.link != "" {
 		headers.Set("Link", resp.link)
 	}
+	return fakeHTTPResponse(http.StatusOK, "200 OK", string(data), headers), nil
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func fakeHTTPResponse(statusCode int, status string, body string, headers http.Header) *http.Response {
+	if headers == nil {
+		headers = make(http.Header)
+	}
 	return &http.Response{
-		StatusCode: http.StatusOK,
-		Status:     "200 OK",
+		StatusCode: statusCode,
+		Status:     status,
 		Header:     headers,
-		Body:       io.NopCloser(strings.NewReader(string(data))),
-	}, nil
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
 }
