@@ -8,11 +8,16 @@ if [[ -z "${version}" ]]; then
 fi
 
 image="${IMAGE:-ghcr.io/buildkite-solutions/gh-concurrency}"
-username="${GHCR_USERNAME:-buildkite-solutions}"
-token="${GHCR_TOKEN:-${GITHUB_TOKEN:-${GH_TOKEN:-}}}"
+username="${GHCR_USERNAME:-}"
+token="${GHCR_TOKEN:-}"
 
 if [[ -z "${token}" ]]; then
-  echo "GHCR_TOKEN, GITHUB_TOKEN, or GH_TOKEN is required to publish to GHCR" >&2
+  echo "GHCR_TOKEN is required to publish to GHCR" >&2
+  exit 2
+fi
+
+if [[ -z "${username}" ]]; then
+  echo "GHCR_USERNAME is required to publish to GHCR" >&2
   exit 2
 fi
 

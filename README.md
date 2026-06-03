@@ -105,7 +105,7 @@ Requirements:
 
 - Go 1.25+
 - Docker with Buildx for image publishing
-- `GITHUB_TOKEN` or `GH_TOKEN` for GitHub Release publishing
+- GitHub App credentials for GitHub Release publishing
 
 ```bash
 make test
@@ -139,10 +139,29 @@ Releases are handled by Buildkite, not GitHub Actions.
 
 2. Add secrets to the Buildkite pipeline or agent environment:
 
-   - `GITHUB_TOKEN` or `GH_TOKEN` with repository release permissions.
-   - `GHCR_TOKEN` or `GITHUB_TOKEN` with permission to publish packages.
-   - `GHCR_USERNAME` if the package publisher should not default to
-     `buildkite-solutions`.
+   Create a GitHub App for releases:
+
+   - Install it only on `buildkite-solutions/gh-concurrency`.
+   - Grant repository permission `Contents: Read and write`.
+   - Disable webhooks; this app is only used to mint release tokens.
+   - Generate a private key.
+
+   Store these Buildkite secrets:
+
+   - `GITHUB_APP_CLIENT_ID`: the app's Client ID from the GitHub App settings.
+   - `GITHUB_APP_PRIVATE_KEY_B64`: the private key PEM, base64-encoded on one
+     line:
+
+     ```bash
+     openssl base64 -A -in path/to/github-app-private-key.pem
+     ```
+
+   Create a narrowly scoped classic PAT for GHCR package publishing and store:
+
+   - `GHCR_USERNAME`: the GitHub username that owns the PAT.
+   - `GHCR_TOKEN`: a classic PAT with `write:packages` for GHCR publishing
+     (`read:packages` is also commonly granted; add `repo` only if publishing a
+     private package requires it).
 
 3. Push a semver tag:
 
@@ -152,10 +171,12 @@ Releases are handled by Buildkite, not GitHub Actions.
    ```
 
 On `v*` tags, Buildkite installs Go 1.25.3 with the `setup-go` plugin, runs
-tests, builds precompiled gh extension binaries, uploads them to the GitHub
-Release, and publishes a multi-arch image to GHCR. The pipeline uses a hosted
-agent cache volume at `.buildkite/cache-volume` to keep toolchain and Go caches
-warm between builds.
+tests, builds precompiled gh extension binaries, mints a one-hour GitHub App
+installation token scoped to `buildkite-solutions/gh-concurrency` with
+`contents: write`, uploads the GitHub Release assets, and publishes a multi-arch
+image to GHCR with `GHCR_TOKEN`. The pipeline uses a hosted agent cache volume
+at `.buildkite/cache-volume` to keep toolchain and Go caches warm between
+builds.
 
 ## Security Model
 

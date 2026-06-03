@@ -2,7 +2,14 @@ package main
 
 import (
 	"bytes"
+	"crypto"
+	cryptorand "crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -28,6 +35,15 @@ type asset struct {
 	Name string `json:"name"`
 }
 
+type repoInstallation struct {
+	ID int64 `json:"id"`
+}
+
+type installationToken struct {
+	Token     string `json:"token"`
+	ExpiresAt string `json:"expires_at"`
+}
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -40,10 +56,6 @@ func run() error {
 	if version == "" {
 		return errors.New("VERSION or BUILDKITE_TAG is required")
 	}
-	token := firstEnv("GITHUB_TOKEN", "GH_TOKEN")
-	if token == "" {
-		return errors.New("GITHUB_TOKEN or GH_TOKEN is required")
-	}
 	repo, err := releaseRepo()
 	if err != nil {
 		return err
@@ -51,9 +63,14 @@ func run() error {
 
 	client := &githubReleaseClient{
 		apiBase: strings.TrimRight(firstEnvOr("GITHUB_API_URL", "https://api.github.com"), "/"),
-		token:   token,
 		http:    &http.Client{Timeout: 60 * time.Second},
 	}
+
+	token, err := client.githubAppInstallationToken(repo)
+	if err != nil {
+		return err
+	}
+	client.token = token
 
 	rel, err := client.releaseByTag(repo, version)
 	if err != nil {
@@ -169,12 +186,134 @@ func releaseNotes(version string) string {
 	return fmt.Sprintf("Install with:\n\n```bash\ngh extension install buildkite-solutions/gh-concurrency\n```\n\nDocker image:\n\n```bash\ndocker pull ghcr.io/buildkite-solutions/gh-concurrency:%s\n```", version)
 }
 
+func githubAppJWT() (string, error) {
+	issuer := firstEnv("GITHUB_APP_CLIENT_ID", "GITHUB_APP_ID")
+	if issuer == "" {
+		return "", errors.New("GITHUB_APP_CLIENT_ID or GITHUB_APP_ID is required")
+	}
+	key, err := githubAppPrivateKey()
+	if err != nil {
+		return "", err
+	}
+
+	now := time.Now().Unix()
+	header := map[string]string{"typ": "JWT", "alg": "RS256"}
+	payload := map[string]any{
+		"iat": now - 60,
+		"exp": now + 600,
+		"iss": issuer,
+	}
+
+	headerJSON, err := json.Marshal(header)
+	if err != nil {
+		return "", err
+	}
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	signingInput := base64.RawURLEncoding.EncodeToString(headerJSON) + "." + base64.RawURLEncoding.EncodeToString(payloadJSON)
+	digest := sha256.Sum256([]byte(signingInput))
+	signature, err := rsa.SignPKCS1v15(cryptorand.Reader, key, crypto.SHA256, digest[:])
+	if err != nil {
+		return "", err
+	}
+	return signingInput + "." + base64.RawURLEncoding.EncodeToString(signature), nil
+}
+
+func githubAppPrivateKey() (*rsa.PrivateKey, error) {
+	var data []byte
+	if raw := os.Getenv("GITHUB_APP_PRIVATE_KEY"); strings.TrimSpace(raw) != "" {
+		data = []byte(strings.ReplaceAll(raw, `\n`, "\n"))
+	} else if raw := os.Getenv("GITHUB_APP_PRIVATE_KEY_B64"); strings.TrimSpace(raw) != "" {
+		decoded, err := decodeBase64(strings.TrimSpace(raw))
+		if err != nil {
+			return nil, fmt.Errorf("decode GITHUB_APP_PRIVATE_KEY_B64: %w", err)
+		}
+		data = decoded
+	} else {
+		return nil, errors.New("GITHUB_APP_PRIVATE_KEY_B64 or GITHUB_APP_PRIVATE_KEY is required")
+	}
+
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return nil, errors.New("GitHub App private key is not valid PEM")
+	}
+	switch block.Type {
+	case "RSA PRIVATE KEY":
+		return x509.ParsePKCS1PrivateKey(block.Bytes)
+	case "PRIVATE KEY":
+		key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		rsaKey, ok := key.(*rsa.PrivateKey)
+		if !ok {
+			return nil, errors.New("GitHub App private key is not an RSA key")
+		}
+		return rsaKey, nil
+	default:
+		return nil, fmt.Errorf("unsupported private key PEM type %q", block.Type)
+	}
+}
+
+func decodeBase64(value string) ([]byte, error) {
+	if decoded, err := base64.StdEncoding.DecodeString(value); err == nil {
+		return decoded, nil
+	}
+	return base64.RawStdEncoding.DecodeString(value)
+}
+
 var errNotFound = errors.New("not found")
 
 type githubReleaseClient struct {
 	apiBase string
 	token   string
 	http    *http.Client
+}
+
+func (c *githubReleaseClient) githubAppInstallationToken(repo string) (string, error) {
+	jwt, err := githubAppJWT()
+	if err != nil {
+		return "", err
+	}
+
+	owner, repoName, err := splitRepo(repo)
+	if err != nil {
+		return "", err
+	}
+
+	var installation repoInstallation
+	if err := c.appRequest(http.MethodGet, fmt.Sprintf("/repos/%s/%s/installation", owner, repoName), nil, &installation, jwt); err != nil {
+		return "", fmt.Errorf("find GitHub App installation for %s: %w", repo, err)
+	}
+	if installation.ID == 0 {
+		return "", fmt.Errorf("GitHub App installation for %s did not include an installation ID", repo)
+	}
+
+	payload := map[string]any{
+		"repositories": []string{repoName},
+		"permissions": map[string]string{
+			"contents": "write",
+		},
+	}
+	var token installationToken
+	if err := c.appRequest(http.MethodPost, fmt.Sprintf("/app/installations/%d/access_tokens", installation.ID), payload, &token, jwt); err != nil {
+		return "", fmt.Errorf("mint GitHub App installation token: %w", err)
+	}
+	if token.Token == "" {
+		return "", errors.New("GitHub App installation token response did not include a token")
+	}
+	fmt.Printf("minted GitHub App installation token for %s (expires %s)\n", repo, token.ExpiresAt)
+	return token.Token, nil
+}
+
+func splitRepo(repo string) (string, string, error) {
+	parts := strings.Split(repo, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("invalid GitHub repository %q; expected owner/repo", repo)
+	}
+	return parts[0], parts[1], nil
 }
 
 func (c *githubReleaseClient) releaseByTag(repo, tag string) (release, error) {
@@ -216,7 +355,7 @@ func (c *githubReleaseClient) uploadAsset(uploadURL, path, name string) error {
 	if err != nil {
 		return err
 	}
-	c.addHeaders(req)
+	c.addHeaders(req, c.token)
 	if ct := mime.TypeByExtension(filepath.Ext(path)); ct != "" {
 		req.Header.Set("Content-Type", ct)
 	} else {
@@ -226,6 +365,14 @@ func (c *githubReleaseClient) uploadAsset(uploadURL, path, name string) error {
 }
 
 func (c *githubReleaseClient) request(method, path string, payload any, into any) error {
+	return c.requestWithBearer(method, path, payload, into, c.token)
+}
+
+func (c *githubReleaseClient) appRequest(method, path string, payload any, into any, jwt string) error {
+	return c.requestWithBearer(method, path, payload, into, jwt)
+}
+
+func (c *githubReleaseClient) requestWithBearer(method, path string, payload any, into any, bearer string) error {
 	var body io.Reader
 	if payload != nil {
 		data, err := json.Marshal(payload)
@@ -238,15 +385,15 @@ func (c *githubReleaseClient) request(method, path string, payload any, into any
 	if err != nil {
 		return err
 	}
-	c.addHeaders(req)
+	c.addHeaders(req, bearer)
 	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	return c.do(req, into)
 }
 
-func (c *githubReleaseClient) addHeaders(req *http.Request) {
-	req.Header.Set("Authorization", "Bearer "+c.token)
+func (c *githubReleaseClient) addHeaders(req *http.Request, bearer string) {
+	req.Header.Set("Authorization", "Bearer "+bearer)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	req.Header.Set("User-Agent", "gh-concurrency-release")
