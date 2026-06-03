@@ -1,0 +1,25 @@
+steps:
+  - label: ":go: Test"
+    key: "test"
+    command: "make test"
+
+  - label: ":package: Build gh extension binaries"
+    key: "release-binaries"
+    depends_on: "test"
+    if: "build.tag =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+/"
+    command:
+      - "scripts/build-release.sh"
+      - "buildkite-agent artifact upload \"dist/*\""
+
+  - label: ":docker: Publish GHCR image"
+    key: "docker"
+    depends_on: "test"
+    if: "build.tag =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+/"
+    command: "scripts/publish-docker.sh"
+
+  - label: ":github: Publish GitHub release"
+    depends_on: "release-binaries"
+    if: "build.tag =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+/"
+    command:
+      - "buildkite-agent artifact download \"dist/*\" ."
+      - "scripts/publish-github-release.sh"

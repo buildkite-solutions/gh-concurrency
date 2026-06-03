@@ -1,0 +1,4 @@
+/dist/
+/gh-concurrency
+__pycache__/
+*.pyc

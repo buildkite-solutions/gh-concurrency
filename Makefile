@@ -1,34 +1,40 @@
-# Override IMAGE to your own Docker Hub namespace, e.g.:
-#   make buildx IMAGE=myorg/gha-concurrency
-IMAGE      ?= YOURDOCKERHUBUSER/gha-concurrency
-VERSION    ?= $(shell sed -n 's/^VERSION = "\(.*\)"/\1/p' gha_concurrency.py)
-VCS_REF    ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
-BUILD_DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+BINARY     ?= gh-concurrency
+GO         ?= go
+IMAGE      ?= ghcr.io/buildkite-solutions/gh-concurrency
+VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+COMMIT     ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+DATE       ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 PLATFORMS  ?= linux/amd64,linux/arm64
 ARGS       ?= --help
 
+LD_FLAGS = -ldflags "-s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.date=$(DATE)"
 BUILD_ARGS = --build-arg VERSION=$(VERSION) \
-             --build-arg VCS_REF=$(VCS_REF) \
-             --build-arg BUILD_DATE=$(BUILD_DATE)
+             --build-arg COMMIT=$(COMMIT) \
+             --build-arg DATE=$(DATE)
 
-.PHONY: test build buildx run lint clean
+.PHONY: test fmt build run docker-build docker-publish release-binaries clean
 
-test:                       ## Run the unit suite (no network, no deps)
-	python3 -m unittest -v
+test:
+	$(GO) test ./...
 
-build: test                 ## Build a local single-arch image
+fmt:
+	$(GO) fmt ./...
+
+build: test
+	$(GO) build -trimpath $(LD_FLAGS) -o $(BINARY) .
+
+run: build
+	./$(BINARY) $(ARGS)
+
+docker-build: test
 	docker build $(BUILD_ARGS) -t $(IMAGE):$(VERSION) -t $(IMAGE):latest .
 
-buildx: test                ## Build + push multi-arch (requires `docker login`)
+docker-publish: test
 	docker buildx build --platform $(PLATFORMS) $(BUILD_ARGS) \
-		--provenance=true --sbom=true \
 		-t $(IMAGE):$(VERSION) -t $(IMAGE):latest --push .
 
-run: build                  ## Run locally; pass flags via ARGS="--repo o/r --since 2025-05-01"
-	docker run --rm -e GITHUB_TOKEN -e GITHUB_API_URL $(IMAGE):$(VERSION) $(ARGS)
-
-lint:                       ## Byte-compile check
-	python3 -m py_compile gha_concurrency.py test_gha_concurrency.py
+release-binaries: test
+	GO=$(GO) scripts/build-release.sh $(VERSION)
 
 clean:
-	docker image rm $(IMAGE):$(VERSION) $(IMAGE):latest 2>/dev/null || true
+	rm -rf dist $(BINARY)

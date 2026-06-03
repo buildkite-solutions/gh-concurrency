@@ -1,137 +1,171 @@
-# gha-concurrency
+# gh-concurrency
 
-Estimate how many GitHub Actions jobs run **at the same time** so you can
-compare GitHub's per-minute billing against a concurrency-based model like
+Estimate how many GitHub Actions jobs run at the same time, so you can compare
+GitHub's per-minute billing model with a concurrency-based model like
 Buildkite's.
 
-GitHub bills Actions by minutes — the *area* under your usage curve. Buildkite
-bills by concurrency — the *height* of that curve. GitHub's billing and metrics
-views never report concurrency, so this tool reconstructs it from job
-start/finish timestamps and reports peak plus time-weighted percentiles.
+GitHub Actions bills for the area under your usage curve. Buildkite plans are
+sized around the height of that curve. GitHub's billing and metrics views do
+not report concurrency directly, so `gh-concurrency` reconstructs it from job
+start and finish timestamps, then reports peak concurrency plus time-weighted
+percentiles.
 
-It runs entirely from your machine, makes only authenticated `GET` requests to
-GitHub, never logs or transmits your token, and has **no third-party
-dependencies** (standard-library Python only).
+The tool is a dependency-free Go binary. It makes authenticated `GET` requests
+only, never logs your token, and works either as a GitHub CLI extension or as a
+container image.
 
-## Quickstart (GitHub cloud)
+## Install
+
+### GitHub CLI extension
 
 ```bash
-docker run --rm -e GITHUB_TOKEN \
-  YOURDOCKERHUBUSER/gha-concurrency:latest \
-  --repo owner/name --since 2025-05-01
+gh extension install buildkite-solutions/gh-concurrency
+gh concurrency --repo owner/name --since 2025-05-01
 ```
 
-`-e GITHUB_TOKEN` passes the token from your shell environment into the
-container without it ever appearing in your command history. Set it first:
+The extension uses your existing `gh auth login` session when no token is set.
+You can also provide `GITHUB_TOKEN`, `GH_TOKEN`, or `--token`.
+
+### Docker
 
 ```bash
 export GITHUB_TOKEN=ghp_xxx
+
+docker run --rm -e GITHUB_TOKEN \
+  ghcr.io/buildkite-solutions/gh-concurrency:latest \
+  --repo owner/name --since 2025-05-01
 ```
 
 Pool several repos into one organization-wide profile by repeating `--repo`:
 
 ```bash
-docker run --rm -e GITHUB_TOKEN YOURDOCKERHUBUSER/gha-concurrency:latest \
-  --repo owner/api --repo owner/web --repo owner/infra --since 2025-05-01
+gh concurrency \
+  --repo owner/api \
+  --repo owner/web \
+  --repo owner/infra \
+  --since 2025-05-01
 ```
 
-## GitHub Enterprise Server (self-hosted GitHub)
+## GitHub Enterprise Server
 
-Point the tool at your instance's API base — either flag or env var:
+Point the tool at your instance's API base:
 
 ```bash
-docker run --rm -e GITHUB_TOKEN \
-  -e GITHUB_API_URL=https://ghes.example.com/api/v3 \
-  YOURDOCKERHUBUSER/gha-concurrency:latest \
-  --repo owner/name --since 2025-05-01
-# equivalently: --base-url https://ghes.example.com/api/v3
+gh auth login --hostname ghes.example.com
+
+gh concurrency \
+  --base-url https://ghes.example.com/api/v3 \
+  --repo owner/name \
+  --since 2025-05-01
 ```
 
-The default is `https://api.github.com` (cloud). For GHES the base path is
-your hostname followed by `/api/v3`.
+For Docker:
 
-## Token scopes (least privilege)
+```bash
+docker run --rm \
+  -e GITHUB_TOKEN \
+  -e GITHUB_API_URL=https://ghes.example.com/api/v3 \
+  ghcr.io/buildkite-solutions/gh-concurrency:latest \
+  --repo owner/name --since 2025-05-01
+```
 
-Use a **fine-grained personal access token** with read-only access:
+## Token Scopes
+
+Use a fine-grained personal access token with read-only access:
 
 - `Actions: read`
 - `Metadata: read`
 
-Or a classic token with `repo` scope. The tool only reads; it never writes,
+Or use a classic token with `repo` scope. The tool only reads; it never writes,
 deletes, or changes anything.
 
-## Reading the output
+## Reading The Output
 
+```text
+Peak concurrency:     42
+p95 concurrency:      18
 ```
-Peak concurrency:     42      <- your single busiest instant
-p95 concurrency:      18      <- size Buildkite around here, not the peak
-Billable-minutes estimate ... <- compare this to your real GitHub invoice
-```
 
-- **Percentiles are time-weighted over busy time** (when ≥1 job was running),
-  so they answer "when I'm actually building, how parallel is it?"
-- **Size toward p95/p99, not peak.** A single 2 a.m. cron fan-out shouldn't
-  make you pay for that capacity all month.
-- **The billable-minutes estimate is your trust check.** It re-derives minutes
-  (rounding each job up to the minute, applying the Linux ×1 / Windows ×2 /
-  macOS ×10 multipliers, treating self-hosted as free). If that total matches
-  your GitHub bill, the concurrency number is built on the same data that just
-  reproduced your invoice.
-- **Heed the warnings.** Sustained queue times or a peak pinned to a round
-  number suggest you were hitting a GitHub concurrency cap — meaning real
-  demand is *higher* than reported. The measured concurrency is a floor, not a
-  ceiling.
+- Percentiles are time-weighted over busy time, when at least one job was
+  running.
+- Size toward p95/p99, not the absolute peak. One nightly fan-out should not
+  make you pay for that slot all month.
+- The billable-minutes estimate re-derives GitHub-hosted Actions minutes by
+  rounding each job up to the minute, then applying Linux x1, Windows x2, and
+  macOS x10 multipliers. Self-hosted jobs are treated as free.
+- Queue-time warnings mean measured concurrency is probably a floor. If jobs
+  waited in GitHub's queue, true demand was higher than observed concurrency.
 
-Add `--format json` for machine-readable output (the JSON is self-describing:
-it includes the tool version, window, and repos). Add `--verbose` for progress
+Use `--format json` for machine-readable output and `--verbose` for progress
 and rate-limit logging on stderr.
 
-## Reliability
+## Build
 
-- Retries with exponential backoff + jitter on `5xx` and rate-limit responses.
-- Honors `Retry-After` and pre-empts the primary rate-limit window using the
-  `X-RateLimit-Remaining` / `-Reset` headers (one jobs call per run, so large
-  orgs generate many calls against the ~5,000/hour limit).
-- A missing or inaccessible repo is skipped with a warning rather than aborting
-  the whole run.
+Requirements:
 
-## Building and publishing
+- Go 1.25+
+- Docker with Buildx for image publishing
+- `gh` for GitHub Release publishing
 
 ```bash
-make test                                  # run the unit suite
-make build  IMAGE=myorg/gha-concurrency    # local single-arch image
-make buildx IMAGE=myorg/gha-concurrency    # multi-arch (amd64+arm64), push
+make test
+make build
+./gh-concurrency --version
 ```
 
-`buildx` depends on `test`, so a failing test blocks publishing. CI in
-`.github/workflows/publish.yml` does the same and pushes on a `v*` tag with
-provenance + SBOM attestations.
+Local Docker image:
 
-### Reproducibility
-
-The image installs nothing — just copies one stdlib script onto a pinned Python
-base — so builds are deterministic given a pinned base. For byte-level
-reproducibility, pin the base by digest in the `Dockerfile`:
-
-```dockerfile
-FROM python:3.12.7-slim-bookworm@sha256:<digest>
+```bash
+make docker-build
+docker run --rm ghcr.io/buildkite-solutions/gh-concurrency:dev --help
 ```
 
-Resolve the current digest with `docker buildx imagetools inspect
-python:3.12.7-slim-bookworm`.
+Build release binaries for the gh extension:
 
-## Security model (what to tell a customer's security team)
+```bash
+make release-binaries VERSION=v1.0.0
+ls dist/
+```
 
-- Read-only: only authenticated `GET` requests, only to the configured GitHub
+## Release
+
+Releases are handled by Buildkite, not GitHub Actions.
+
+1. Configure the Buildkite pipeline command as:
+
+   ```bash
+   buildkite-agent pipeline upload
+   ```
+
+2. Add secrets to the Buildkite pipeline or agent environment:
+
+   - `GITHUB_TOKEN` or `GH_TOKEN` with repository release permissions.
+   - `GHCR_TOKEN` or `GITHUB_TOKEN` with permission to publish packages.
+   - `GHCR_USERNAME` if the package publisher should not default to
+     `buildkite-solutions`.
+
+3. Push a semver tag:
+
+   ```bash
+   git tag v1.0.0
+   git push origin v1.0.0
+   ```
+
+On `v*` tags, Buildkite runs tests, builds precompiled gh extension binaries,
+uploads them to the GitHub Release, and publishes a multi-arch image to GHCR.
+
+## Security Model
+
+- Read-only: authenticated `GET` requests only, scoped to the configured GitHub
   API host.
-- The token is read from the environment, never written to disk, never logged,
-  never sent anywhere except as the `Authorization` header to GitHub.
-- No outbound calls to any third party — no telemetry, no "phone home."
-- Runs as a non-root user (UID 10001).
-- The entire tool is a single ~300-line dependency-free script; diff it against
-  this repo and audit it in one sitting.
+- The token is read from env, `--token`, or `gh auth token`; it is never written
+  to disk or logged.
+- No telemetry and no third-party API calls.
+- The Docker image runs a static Go binary as UID `10001`.
+- The core implementation is small enough to audit in one sitting.
 
-Customers run it themselves and send you the JSON output — never their token.
+Customers can run it themselves and share the JSON output. They never need to
+share their GitHub token.
 
 ## License
 

@@ -1,11 +1,11 @@
 # Convenience wrapper for customers who prefer an env file over -e flags.
-# 1. Copy your token into a local .env (which .dockerignore keeps out of images):
+# 1. Copy your token into a local .env:
 #      echo "GITHUB_TOKEN=ghp_xxx" > .env
-#      # GHES users also add: echo "GITHUB_API_URL=https://ghes.example.com/api/v3" >> .env
+#      # GHES users also add:
+#      # echo "GITHUB_API_URL=https://ghes.example.com/api/v3" >> .env
 # 2. Run:
-#      docker compose run --rm gha-concurrency --repo owner/name --since 2025-05-01
+#      docker compose run --rm gh-concurrency --repo owner/name --since 2025-05-01
 services:
-  gha-concurrency:
-    image: YOURDOCKERHUBUSER/gha-concurrency:latest
+  gh-concurrency:
+    image: ghcr.io/buildkite-solutions/gh-concurrency:latest
     env_file: .env
-    # Anything you append on the CLI is forwarded to the tool's entrypoint.
