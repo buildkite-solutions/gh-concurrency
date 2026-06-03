@@ -35,15 +35,20 @@ var osMultiplier = map[string]int{
 }
 
 type config struct {
-	repos      []string
-	since      string
-	until      string
-	baseURL    string
-	token      string
-	format     string
-	maxRetries int
-	verbose    bool
-	showVer    bool
+	repos          []string
+	orgs           []string
+	repoFiles      []string
+	orgFiles       []string
+	repoType       string
+	since          string
+	until          string
+	baseURL        string
+	token          string
+	format         string
+	maxRetries     int
+	requestDelayMS int
+	verbose        bool
+	showVer        bool
 }
 
 type stringList []string
@@ -60,6 +65,9 @@ func (s *stringList) String() string {
 func parseArgs(argv []string, stderr io.Writer) (config, error) {
 	var cfg config
 	var repos stringList
+	var orgs stringList
+	var repoFiles stringList
+	var orgFiles stringList
 	baseURL := os.Getenv("GITHUB_API_URL")
 	if baseURL == "" {
 		baseURL = defaultBaseURL
@@ -68,12 +76,17 @@ func parseArgs(argv []string, stderr io.Writer) (config, error) {
 	fs := flag.NewFlagSet("gh-concurrency", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Var(&repos, "repo", "repository in OWNER/NAME form (repeatable; repos pool into one profile)")
+	fs.Var(&orgs, "org", "GitHub organization whose accessible repositories should be pooled (repeatable)")
+	fs.Var(&repoFiles, "repo-file", "file containing OWNER/NAME repositories, one per line or comma/space separated (repeatable)")
+	fs.Var(&orgFiles, "org-file", "file containing organization names, one per line or comma/space separated (repeatable)")
+	fs.StringVar(&cfg.repoType, "repo-type", "all", "organization repository type: all, public, private, forks, sources, or member")
 	fs.StringVar(&cfg.since, "since", "", "lower bound on workflow-run creation date (YYYY-MM-DD)")
 	fs.StringVar(&cfg.until, "until", "", "optional upper bound on workflow-run creation date (YYYY-MM-DD)")
 	fs.StringVar(&cfg.baseURL, "base-url", baseURL, "API base URL. GHES: https://HOST/api/v3 (env: GITHUB_API_URL)")
 	fs.StringVar(&cfg.token, "token", envToken(), "GitHub token (default: GITHUB_TOKEN or GH_TOKEN; gh auth fallback when available)")
 	fs.StringVar(&cfg.format, "format", "text", "output format: text or json")
 	fs.IntVar(&cfg.maxRetries, "max-retries", 6, "maximum HTTP retry attempts")
+	fs.IntVar(&cfg.requestDelayMS, "request-delay-ms", 100, "minimum delay before each GitHub API request; helps avoid secondary rate limits")
 	fs.BoolVar(&cfg.verbose, "verbose", false, "progress and rate-limit logging to stderr")
 	fs.BoolVar(&cfg.showVer, "version", false, "print version and exit")
 
@@ -81,9 +94,15 @@ func parseArgs(argv []string, stderr io.Writer) (config, error) {
 		return cfg, err
 	}
 	cfg.repos = repos
+	cfg.orgs = orgs
+	cfg.repoFiles = repoFiles
+	cfg.orgFiles = orgFiles
 	cfg.baseURL = strings.TrimRight(cfg.baseURL, "/")
 	if cfg.maxRetries < 1 {
 		cfg.maxRetries = 1
+	}
+	if cfg.requestDelayMS < 0 {
+		cfg.requestDelayMS = 0
 	}
 	return cfg, nil
 }
@@ -92,16 +111,27 @@ func validateConfig(cfg config) error {
 	if cfg.showVer {
 		return nil
 	}
-	if len(cfg.repos) == 0 {
-		return errors.New("at least one --repo OWNER/NAME is required")
+	if len(cfg.repos) == 0 && len(cfg.orgs) == 0 && len(cfg.repoFiles) == 0 && len(cfg.orgFiles) == 0 {
+		return errors.New("at least one --repo, --org, --repo-file, or --org-file is required")
 	}
 	for _, repo := range cfg.repos {
-		if strings.Count(repo, "/") != 1 {
-			return fmt.Errorf("invalid repo %q; expected OWNER/NAME", repo)
+		if err := validateRepo(repo); err != nil {
+			return err
 		}
-		parts := strings.Split(repo, "/")
-		if parts[0] == "" || parts[1] == "" {
-			return fmt.Errorf("invalid repo %q; expected OWNER/NAME", repo)
+	}
+	for _, org := range cfg.orgs {
+		if err := validateOrg(org); err != nil {
+			return err
+		}
+	}
+	switch cfg.repoType {
+	case "all", "public", "private", "forks", "sources", "member":
+	default:
+		return fmt.Errorf("invalid --repo-type %q; expected all, public, private, forks, sources, or member", cfg.repoType)
+	}
+	for _, path := range append(append([]string{}, cfg.repoFiles...), cfg.orgFiles...) {
+		if strings.TrimSpace(path) == "" {
+			return errors.New("target file path cannot be empty")
 		}
 	}
 	if cfg.since == "" {
@@ -123,6 +153,192 @@ func validateConfig(cfg config) error {
 		return fmt.Errorf("invalid --base-url %q", cfg.baseURL)
 	}
 	return nil
+}
+
+func validateRepo(repo string) error {
+	owner, name, err := splitRepoName(repo)
+	if err != nil {
+		return err
+	}
+	if owner == "" || name == "" {
+		return fmt.Errorf("invalid repo %q; expected OWNER/NAME", repo)
+	}
+	return nil
+}
+
+func validateOrg(org string) error {
+	org = strings.TrimSpace(org)
+	if org == "" || strings.Contains(org, "/") || strings.ContainsAny(org, " \t\r\n") {
+		return fmt.Errorf("invalid org %q; expected organization slug", org)
+	}
+	return nil
+}
+
+func splitRepoName(repo string) (string, string, error) {
+	repo = strings.TrimSpace(repo)
+	if strings.Count(repo, "/") != 1 {
+		return "", "", fmt.Errorf("invalid repo %q; expected OWNER/NAME", repo)
+	}
+	parts := strings.Split(repo, "/")
+	if parts[0] == "" || parts[1] == "" || strings.ContainsAny(repo, " \t\r\n") {
+		return "", "", fmt.Errorf("invalid repo %q; expected OWNER/NAME", repo)
+	}
+	return parts[0], parts[1], nil
+}
+
+func repoAPIPath(repo string) (string, error) {
+	owner, name, err := splitRepoName(repo)
+	if err != nil {
+		return "", err
+	}
+	return "/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name), nil
+}
+
+func readListFile(path string) ([]string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return parseListFile(string(data)), nil
+}
+
+func parseListFile(contents string) []string {
+	var values []string
+	for _, line := range strings.Split(contents, "\n") {
+		if idx := strings.Index(line, "#"); idx >= 0 {
+			line = line[:idx]
+		}
+		line = strings.ReplaceAll(line, ",", " ")
+		for _, value := range strings.Fields(line) {
+			values = append(values, strings.TrimSpace(value))
+		}
+	}
+	return values
+}
+
+func resolveTargetRepos(client *githubClient, cfg config, stderr io.Writer) ([]string, error) {
+	var repos []string
+	for _, repo := range cfg.repos {
+		if err := validateRepo(repo); err != nil {
+			return nil, err
+		}
+		repos = append(repos, repo)
+	}
+
+	for _, path := range cfg.repoFiles {
+		fileRepos, err := readListFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read --repo-file %s: %w", path, err)
+		}
+		for _, repo := range fileRepos {
+			if err := validateRepo(repo); err != nil {
+				return nil, err
+			}
+			repos = append(repos, repo)
+		}
+	}
+
+	orgs := append([]string{}, cfg.orgs...)
+	for _, path := range cfg.orgFiles {
+		fileOrgs, err := readListFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read --org-file %s: %w", path, err)
+		}
+		for _, org := range fileOrgs {
+			if err := validateOrg(org); err != nil {
+				return nil, err
+			}
+			orgs = append(orgs, org)
+		}
+	}
+
+	for _, org := range uniqueStrings(orgs) {
+		client.logf("listing repositories for org %s", org)
+		orgRepos, err := listOrgRepos(client, org, cfg.repoType)
+		if err != nil {
+			var nf notFoundError
+			if errors.As(err, &nf) {
+				fmt.Fprintf(stderr, "warning: org %s not found or no repository access; skipping.\n", org)
+				continue
+			}
+			return nil, err
+		}
+		repos = append(repos, orgRepos...)
+	}
+
+	repos = uniqueRepos(repos)
+	sort.Slice(repos, func(i, j int) bool {
+		return strings.ToLower(repos[i]) < strings.ToLower(repos[j])
+	})
+	return repos, nil
+}
+
+func uniqueStrings(values []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		key := strings.ToLower(value)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func uniqueRepos(repos []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, repo := range repos {
+		repo = strings.TrimSpace(repo)
+		if repo == "" {
+			continue
+		}
+		key := strings.ToLower(repo)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, repo)
+	}
+	return out
+}
+
+type orgRepo struct {
+	FullName string `json:"full_name"`
+	Disabled bool   `json:"disabled"`
+}
+
+func listOrgRepos(client *githubClient, org, repoType string) ([]string, error) {
+	if err := validateOrg(org); err != nil {
+		return nil, err
+	}
+	params := url.Values{
+		"type":      []string{repoType},
+		"sort":      []string{"full_name"},
+		"direction": []string{"asc"},
+	}
+	var repos []string
+	err := client.paginate("/orgs/"+url.PathEscape(org)+"/repos", params, "", func(raw json.RawMessage) error {
+		var repo orgRepo
+		if err := json.Unmarshal(raw, &repo); err != nil {
+			return err
+		}
+		if repo.FullName == "" || repo.Disabled {
+			return nil
+		}
+		repos = append(repos, repo.FullName)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return repos, nil
 }
 
 func envToken() string {
@@ -173,14 +389,15 @@ func ghHostForBaseURL(baseURL string) string {
 }
 
 type githubClient struct {
-	baseURL    string
-	token      string
-	maxRetries int
-	timeout    time.Duration
-	verbose    bool
-	httpClient *http.Client
-	sleep      func(time.Duration)
-	now        func() time.Time
+	baseURL      string
+	token        string
+	maxRetries   int
+	timeout      time.Duration
+	requestDelay time.Duration
+	verbose      bool
+	httpClient   *http.Client
+	sleep        func(time.Duration)
+	now          func() time.Time
 }
 
 func newGitHubClient(baseURL, token string, maxRetries int, verbose bool) *githubClient {
@@ -205,6 +422,9 @@ func (c *githubClient) logf(format string, args ...interface{}) {
 func (c *githubClient) request(rawURL string) ([]byte, string, error) {
 	var lastErr error
 	for attempt := 0; attempt < c.maxRetries; attempt++ {
+		if c.requestDelay > 0 {
+			c.sleep(c.requestDelay)
+		}
 		req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 		if err != nil {
 			return nil, "", err
@@ -272,6 +492,10 @@ func (c *githubClient) request(rawURL string) ([]byte, string, error) {
 					}
 				}
 			}
+			if isSecondaryRateLimit(resp.StatusCode, body) && attempt < c.maxRetries-1 {
+				c.secondaryBackoff(attempt)
+				continue
+			}
 			return nil, "", err
 		case resp.StatusCode >= 500:
 			lastErr = err
@@ -307,6 +531,25 @@ func (c *githubClient) backoff(attempt int) {
 	delay := base + jitter
 	c.logf("backing off %.1fs (attempt %d)", delay.Seconds(), attempt+1)
 	c.sleep(delay)
+}
+
+func (c *githubClient) secondaryBackoff(attempt int) {
+	base := time.Duration(1<<uint(min(attempt, 5))) * time.Minute
+	jitter := time.Duration(rand.Intn(5000)) * time.Millisecond
+	delay := base + jitter
+	c.logf("secondary rate limit: backing off %.0fs (attempt %d)", delay.Seconds(), attempt+1)
+	c.sleep(delay)
+}
+
+func isSecondaryRateLimit(status int, body []byte) bool {
+	if status == http.StatusTooManyRequests {
+		return true
+	}
+	msg := strings.ToLower(string(body))
+	return strings.Contains(msg, "secondary rate limit") ||
+		strings.Contains(msg, "abuse detection") ||
+		strings.Contains(msg, "too many requests") ||
+		strings.Contains(msg, "retry your request again later")
 }
 
 func (c *githubClient) sleepUntil(resetEpoch int64, reason string) {
@@ -433,15 +676,19 @@ func collectJobs(client *githubClient, repo, since, until string) ([]record, err
 	if until != "" {
 		created = since + ".." + until
 	}
+	repoPath, err := repoAPIPath(repo)
+	if err != nil {
+		return nil, err
+	}
 
 	var out []record
 	params := url.Values{"created": []string{created}}
-	err := client.paginate("/repos/"+repo+"/actions/runs", params, "workflow_runs", func(raw json.RawMessage) error {
+	err = client.paginate(repoPath+"/actions/runs", params, "workflow_runs", func(raw json.RawMessage) error {
 		var run workflowRun
 		if err := json.Unmarshal(raw, &run); err != nil {
 			return err
 		}
-		return client.paginate("/repos/"+repo+"/actions/runs/"+strconv.FormatInt(run.ID, 10)+"/jobs", nil, "jobs", func(rawJob json.RawMessage) error {
+		return client.paginate(repoPath+"/actions/runs/"+strconv.FormatInt(run.ID, 10)+"/jobs", nil, "jobs", func(rawJob json.RawMessage) error {
 			var job workflowJob
 			if err := json.Unmarshal(rawJob, &job); err != nil {
 				return err
@@ -672,10 +919,15 @@ func detectWarnings(peak int, pct map[int]int, qstats *queueStats) []string {
 }
 
 type parameters struct {
-	Repos   []string `json:"repos"`
-	Since   string   `json:"since"`
-	Until   string   `json:"until,omitempty"`
-	BaseURL string   `json:"base_url"`
+	Repos           []string `json:"repos"`
+	Orgs            []string `json:"orgs,omitempty"`
+	RepoFiles       []string `json:"repo_files,omitempty"`
+	OrgFiles        []string `json:"org_files,omitempty"`
+	RepoType        string   `json:"repo_type,omitempty"`
+	RepositoryCount int      `json:"repository_count"`
+	Since           string   `json:"since"`
+	Until           string   `json:"until,omitempty"`
+	BaseURL         string   `json:"base_url"`
 }
 
 type report struct {
@@ -709,10 +961,15 @@ func buildReport(records []record, cfg config) report {
 		Version:     version,
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 		Parameters: parameters{
-			Repos:   cfg.repos,
-			Since:   cfg.since,
-			Until:   cfg.until,
-			BaseURL: cfg.baseURL,
+			Repos:           cfg.repos,
+			Orgs:            cfg.orgs,
+			RepoFiles:       cfg.repoFiles,
+			OrgFiles:        cfg.orgFiles,
+			RepoType:        cfg.repoType,
+			RepositoryCount: len(cfg.repos),
+			Since:           cfg.since,
+			Until:           cfg.until,
+			BaseURL:         cfg.baseURL,
 		},
 		JobsAnalyzed:            len(records),
 		BusyHours:               math.Round((busySeconds/3600.0)*100) / 100,
@@ -731,7 +988,17 @@ func printText(out io.Writer, rep report) {
 		until = "now"
 	}
 	fmt.Fprintf(out, "\ngh-concurrency v%s\n", rep.Version)
-	fmt.Fprintf(out, "repos:  %s\n", strings.Join(p.Repos, ", "))
+	if len(p.Orgs) > 0 {
+		fmt.Fprintf(out, "orgs:   %s\n", strings.Join(p.Orgs, ", "))
+	}
+	if len(p.RepoFiles) > 0 {
+		fmt.Fprintf(out, "repo files: %s\n", strings.Join(p.RepoFiles, ", "))
+	}
+	if len(p.OrgFiles) > 0 {
+		fmt.Fprintf(out, "org files:  %s\n", strings.Join(p.OrgFiles, ", "))
+	}
+	fmt.Fprintf(out, "repos:  %s\n", summarizeRepos(p.Repos))
+	fmt.Fprintf(out, "repo count: %d\n", p.RepositoryCount)
 	fmt.Fprintf(out, "window: %s -> %s   api: %s\n", p.Since, until, p.BaseURL)
 	fmt.Fprintf(out, "\nJobs analyzed:        %d\n", rep.JobsAnalyzed)
 	fmt.Fprintf(out, "Busy wall-clock time: %.2fh (>=1 job running)\n", rep.BusyHours)
@@ -762,6 +1029,17 @@ func printText(out io.Writer, rep report) {
 	for _, warning := range rep.Warnings {
 		fmt.Fprintf(out, "\nWARNING: %s\n", warning)
 	}
+}
+
+func summarizeRepos(repos []string) string {
+	if len(repos) == 0 {
+		return "(none)"
+	}
+	if len(repos) <= 12 {
+		return strings.Join(repos, ", ")
+	}
+	shown := append([]string{}, repos[:12]...)
+	return strings.Join(shown, ", ") + fmt.Sprintf(", ... (%d total)", len(repos))
 }
 
 func sortedStringKeys[T any](m map[string]T) []string {
@@ -815,6 +1093,23 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	}
 
 	client := newGitHubClient(cfg.baseURL, token, cfg.maxRetries, cfg.verbose)
+	client.requestDelay = time.Duration(cfg.requestDelayMS) * time.Millisecond
+	targetRepos, err := resolveTargetRepos(client, cfg, stderr)
+	if err != nil {
+		var ae authError
+		if errors.As(err, &ae) {
+			fmt.Fprintln(stderr, "error: 401 unauthorized. Check token scope and validity.")
+			return 1
+		}
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
+	if len(targetRepos) == 0 {
+		fmt.Fprintln(stderr, "error: no repositories matched the requested targets.")
+		return 1
+	}
+	cfg.repos = targetRepos
+
 	var records []record
 	for _, repo := range cfg.repos {
 		client.logf("fetching %s since %s", repo, cfg.since)
