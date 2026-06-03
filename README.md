@@ -105,7 +105,7 @@ Requirements:
 
 - Go 1.25+
 - Docker with Buildx for image publishing
-- `gh` for GitHub Release publishing
+- `GITHUB_TOKEN` or `GH_TOKEN` for GitHub Release publishing
 
 ```bash
 make test
@@ -151,8 +151,11 @@ Releases are handled by Buildkite, not GitHub Actions.
    git push origin v1.0.0
    ```
 
-On `v*` tags, Buildkite runs tests, builds precompiled gh extension binaries,
-uploads them to the GitHub Release, and publishes a multi-arch image to GHCR.
+On `v*` tags, Buildkite installs Go 1.25.3 with the `setup-go` plugin, runs
+tests, builds precompiled gh extension binaries, uploads them to the GitHub
+Release, and publishes a multi-arch image to GHCR. The pipeline uses a hosted
+agent cache volume at `.buildkite/cache-volume` to keep toolchain and Go caches
+warm between builds.
 
 ## Security Model
 

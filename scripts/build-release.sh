@@ -41,4 +41,8 @@ for target in "${targets[@]}"; do
   fi
 done
 
-(cd dist && shasum -a 256 * > checksums.txt)
+if command -v sha256sum >/dev/null 2>&1; then
+  (cd dist && sha256sum * > checksums.txt)
+else
+  (cd dist && shasum -a 256 * > checksums.txt)
+fi
