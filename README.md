@@ -137,24 +137,57 @@ Releases are handled by Buildkite, not GitHub Actions.
    buildkite-agent pipeline upload
    ```
 
-2. Add secrets to the Buildkite pipeline or agent environment:
+2. Create a GitHub App for release publishing:
 
-   Create a GitHub App for releases:
+   Create the app from the organization, not from your personal settings and
+   not from the repository settings:
 
-   - Install it only on `buildkite-solutions/gh-concurrency`.
-   - Grant repository permission `Contents: Read and write`.
-   - Disable webhooks; this app is only used to mint release tokens.
-   - Generate a private key.
+   - Go to `https://github.com/organizations/buildkite-solutions/settings/apps`
+     or GitHub profile menu -> Your organizations -> `buildkite-solutions` ->
+     Settings -> Developer settings -> GitHub Apps.
+   - Click New GitHub App.
+   - Use a short unique name, for example `bk-gh-concurrency-release`.
+   - Set Homepage URL to `https://github.com/buildkite-solutions/gh-concurrency`.
+   - Leave Callback URL and Setup URL blank.
+   - In Webhook, uncheck Active. No webhook URL is needed.
+   - Under Repository permissions, set Contents to Read and write. Leave every
+     other permission as No access. Metadata will remain read-only because
+     GitHub Apps always get it.
+   - Do not subscribe to any events.
+   - Under "Where can this GitHub App be installed?", choose Only on this
+     account.
+   - Click Create GitHub App.
 
-   Store these Buildkite secrets:
+   If you do not see organization Developer settings, you need an organization
+   owner or GitHub App manager to create the app.
 
-   - `GITHUB_APP_CLIENT_ID`: the app's Client ID from the GitHub App settings.
-   - `GITHUB_APP_PRIVATE_KEY_B64`: the private key PEM, base64-encoded on one
-     line:
+3. Install the app only on this repository:
+
+   - On the app settings page, click Install App in the left sidebar.
+   - Click Install next to `buildkite-solutions`.
+   - Choose Only select repositories.
+   - Select `gh-concurrency`.
+   - Click Install.
+
+4. Create the app secret values:
+
+   - On the app settings page, copy the Client ID.
+   - Under Private keys, click Generate a private key. GitHub downloads a `.pem`
+     file.
+   - Base64-encode the PEM into one line:
 
      ```bash
      openssl base64 -A -in path/to/github-app-private-key.pem
      ```
+
+5. Add Buildkite secrets:
+
+   In Buildkite, add secrets for the pipeline's agent cluster. The release step
+   expects:
+
+   - `GITHUB_APP_CLIENT_ID`: the GitHub App Client ID.
+   - `GITHUB_APP_PRIVATE_KEY_B64`: the one-line base64 value from the private
+     key PEM.
 
    Create a narrowly scoped classic PAT for GHCR package publishing and store:
 
@@ -163,7 +196,7 @@ Releases are handled by Buildkite, not GitHub Actions.
      (`read:packages` is also commonly granted; add `repo` only if publishing a
      private package requires it).
 
-3. Push a semver tag:
+6. Push a semver tag:
 
    ```bash
    git tag v1.0.0
