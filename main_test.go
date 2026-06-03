@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"math/rand"
@@ -176,6 +177,31 @@ func TestBillableMinutesSelfHostedIsFree(t *testing.T) {
 	}
 }
 
+func TestBuildReportIncludesRuntimeSeconds(t *testing.T) {
+	got := buildReport([]record{rec(60, "linux", false)}, config{
+		repos:   []string{"o/r"},
+		since:   "2025-05-01",
+		baseURL: defaultBaseURL,
+	}, 1500*time.Millisecond)
+	if got.RuntimeSeconds != 1.5 {
+		t.Fatalf("runtime_seconds = %v, want 1.5", got.RuntimeSeconds)
+	}
+}
+
+func TestPrintTextIncludesRunTime(t *testing.T) {
+	rep := buildReport([]record{rec(60, "linux", false)}, config{
+		repos:   []string{"o/r"},
+		since:   "2025-05-01",
+		baseURL: defaultBaseURL,
+	}, 2300*time.Millisecond)
+
+	var out bytes.Buffer
+	printText(&out, rep)
+	if !strings.Contains(out.String(), "Run time:             2.3s") {
+		t.Fatalf("output missing run time:\n%s", out.String())
+	}
+}
+
 func TestNextLinkPresent(t *testing.T) {
 	header := `<https://api.github.com/x?page=2>; rel="next", <https://api.github.com/x?page=9>; rel="last"`
 	got := nextLink(header)
@@ -210,6 +236,50 @@ other-org/repo # inline comment
 	}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("parseListFile = %v, want %v", got, want)
+	}
+}
+
+func TestParseArgsVerboseAndDebugAliases(t *testing.T) {
+	cfg, err := parseArgs([]string{"--repo", "o/r", "--since", "2025-05-01", "-v"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.verbose {
+		t.Fatal("-v did not enable verbose logging")
+	}
+
+	cfg, err = parseArgs([]string{"--repo", "o/r", "--since", "2025-05-01", "-d"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.debug || !cfg.verbose {
+		t.Fatalf("-d debug/verbose = %v/%v, want true/true", cfg.debug, cfg.verbose)
+	}
+}
+
+func TestProgressBar(t *testing.T) {
+	got := progressBar(3, 10, 10)
+	if got != "[###-------]" {
+		t.Fatalf("progressBar = %q, want [###-------]", got)
+	}
+}
+
+func TestProgressReporterWritesRepoProgress(t *testing.T) {
+	var buf bytes.Buffer
+	progress := newProgressReporter(&buf, true, 2)
+	progress.Begin()
+	progress.Start("o/r")
+	progress.Done("o/r", 3)
+
+	out := buf.String()
+	for _, want := range []string{
+		"repositories queued: 2",
+		"examining repo 1/2: o/r",
+		"done: o/r (3 jobs, 3 total)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("progress output missing %q:\n%s", want, out)
+		}
 	}
 }
 
@@ -343,6 +413,39 @@ func TestSecondaryRateLimitBackoffRetries(t *testing.T) {
 	}
 	if len(sleeps) != 1 || sleeps[0] < time.Minute {
 		t.Fatalf("sleeps = %v, want one secondary backoff >= 1m", sleeps)
+	}
+}
+
+func TestDebugRequestLogging(t *testing.T) {
+	var logs bytes.Buffer
+	headers := make(http.Header)
+	headers.Set("X-RateLimit-Remaining", "4999")
+	headers.Set("X-RateLimit-Reset", "1746122400")
+
+	client := newGitHubClient("https://api.github.com", "tok", 1, false)
+	client.debug = true
+	client.logWriter = &logs
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return fakeHTTPResponse(http.StatusOK, "200 OK", `{"ok":true}`, headers), nil
+	})}
+	client.sleep = func(time.Duration) {}
+
+	if _, _, err := client.request("https://api.github.com/repos/o/r/actions/runs?per_page=100"); err != nil {
+		t.Fatal(err)
+	}
+	out := logs.String()
+	for _, want := range []string{
+		"GET https://api.github.com/repos/o/r/actions/runs?per_page=100",
+		"200 OK",
+		"remaining=4999",
+		"reset=2025-05-01T18:00:00Z",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("debug log missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "tok") {
+		t.Fatalf("debug log leaked token:\n%s", out)
 	}
 }
 

@@ -48,6 +48,7 @@ type config struct {
 	maxRetries     int
 	requestDelayMS int
 	verbose        bool
+	debug          bool
 	showVer        bool
 }
 
@@ -88,6 +89,9 @@ func parseArgs(argv []string, stderr io.Writer) (config, error) {
 	fs.IntVar(&cfg.maxRetries, "max-retries", 6, "maximum HTTP retry attempts")
 	fs.IntVar(&cfg.requestDelayMS, "request-delay-ms", 100, "minimum delay before each GitHub API request; helps avoid secondary rate limits")
 	fs.BoolVar(&cfg.verbose, "verbose", false, "progress and rate-limit logging to stderr")
+	fs.BoolVar(&cfg.verbose, "v", false, "alias for --verbose")
+	fs.BoolVar(&cfg.debug, "debug", false, "HTTP request and pagination diagnostics to stderr; implies --verbose")
+	fs.BoolVar(&cfg.debug, "d", false, "alias for --debug")
 	fs.BoolVar(&cfg.showVer, "version", false, "print version and exit")
 
 	if err := fs.Parse(argv); err != nil {
@@ -103,6 +107,9 @@ func parseArgs(argv []string, stderr io.Writer) (config, error) {
 	}
 	if cfg.requestDelayMS < 0 {
 		cfg.requestDelayMS = 0
+	}
+	if cfg.debug {
+		cfg.verbose = true
 	}
 	return cfg, nil
 }
@@ -395,6 +402,8 @@ type githubClient struct {
 	timeout      time.Duration
 	requestDelay time.Duration
 	verbose      bool
+	debug        bool
+	logWriter    io.Writer
 	httpClient   *http.Client
 	sleep        func(time.Duration)
 	now          func() time.Time
@@ -407,6 +416,7 @@ func newGitHubClient(baseURL, token string, maxRetries int, verbose bool) *githu
 		maxRetries: maxRetries,
 		timeout:    30 * time.Second,
 		verbose:    verbose,
+		logWriter:  os.Stderr,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 		sleep:      time.Sleep,
 		now:        time.Now,
@@ -414,9 +424,22 @@ func newGitHubClient(baseURL, token string, maxRetries int, verbose bool) *githu
 }
 
 func (c *githubClient) logf(format string, args ...interface{}) {
-	if c.verbose {
-		fmt.Fprintf(os.Stderr, "[gh-concurrency] "+format+"\n", args...)
+	if c.verbose || c.debug {
+		fmt.Fprintf(c.logOutput(), "[gh-concurrency] "+format+"\n", args...)
 	}
+}
+
+func (c *githubClient) debugf(format string, args ...interface{}) {
+	if c.debug {
+		fmt.Fprintf(c.logOutput(), "[gh-concurrency debug] "+format+"\n", args...)
+	}
+}
+
+func (c *githubClient) logOutput() io.Writer {
+	if c.logWriter != nil {
+		return c.logWriter
+	}
+	return io.Discard
 }
 
 func (c *githubClient) request(rawURL string) ([]byte, string, error) {
@@ -434,6 +457,7 @@ func (c *githubClient) request(rawURL string) ([]byte, string, error) {
 		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 		req.Header.Set("User-Agent", "gh-concurrency/"+version)
 
+		c.debugf("GET %s (attempt %d/%d)", requestURLForLog(rawURL), attempt+1, c.maxRetries)
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			lastErr = err
@@ -444,6 +468,7 @@ func (c *githubClient) request(rawURL string) ([]byte, string, error) {
 			c.backoff(attempt)
 			continue
 		}
+		c.debugResponse(rawURL, resp)
 
 		body, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
@@ -514,6 +539,43 @@ func (c *githubClient) request(rawURL string) ([]byte, string, error) {
 	return nil, "", fmt.Errorf("exhausted %d retries for %s: %w", c.maxRetries, rawURL, lastErr)
 }
 
+func (c *githubClient) debugResponse(rawURL string, resp *http.Response) {
+	if !c.debug {
+		return
+	}
+	var details []string
+	if remaining := resp.Header.Get("X-RateLimit-Remaining"); remaining != "" {
+		details = append(details, "remaining="+remaining)
+	}
+	if reset := resp.Header.Get("X-RateLimit-Reset"); reset != "" {
+		details = append(details, "reset="+formatRateReset(reset))
+	}
+	if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
+		details = append(details, "retry-after="+retryAfter+"s")
+	}
+	suffix := ""
+	if len(details) > 0 {
+		suffix = " (" + strings.Join(details, ", ") + ")"
+	}
+	c.debugf("%s -> %s%s", requestURLForLog(rawURL), resp.Status, suffix)
+}
+
+func requestURLForLog(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	return u.String()
+}
+
+func formatRateReset(value string) string {
+	epoch, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return value
+	}
+	return time.Unix(epoch, 0).UTC().Format(time.RFC3339)
+}
+
 func (c *githubClient) httpError(resp *http.Response, body []byte) error {
 	msg := strings.TrimSpace(string(bytes.TrimSpace(body)))
 	if len(msg) > 500 {
@@ -571,11 +633,94 @@ func min(a, b int) int {
 	return b
 }
 
+type progressReporter struct {
+	out       io.Writer
+	enabled   bool
+	total     int
+	done      int
+	totalJobs int
+	started   time.Time
+}
+
+func newProgressReporter(out io.Writer, enabled bool, total int) *progressReporter {
+	return &progressReporter{
+		out:     out,
+		enabled: enabled && out != nil,
+		total:   total,
+		started: time.Now(),
+	}
+}
+
+func (p *progressReporter) Begin() {
+	if !p.enabled {
+		return
+	}
+	fmt.Fprintf(p.out, "[gh-concurrency] repositories queued: %d\n", p.total)
+	fmt.Fprintf(p.out, "[gh-concurrency] progress: %s 0/%d\n", progressBar(0, p.total, 24), p.total)
+}
+
+func (p *progressReporter) Start(repo string) {
+	if !p.enabled {
+		return
+	}
+	fmt.Fprintf(p.out, "[gh-concurrency] examining repo %d/%d: %s\n", p.done+1, p.total, repo)
+}
+
+func (p *progressReporter) Done(repo string, jobs int) {
+	if !p.enabled {
+		return
+	}
+	p.done++
+	p.totalJobs += jobs
+	fmt.Fprintf(p.out, "[gh-concurrency] progress: %s %d/%d done: %s (%d jobs, %d total)\n",
+		progressBar(p.done, p.total, 24), p.done, p.total, repo, jobs, p.totalJobs)
+}
+
+func (p *progressReporter) Skip(repo string) {
+	if !p.enabled {
+		return
+	}
+	p.done++
+	fmt.Fprintf(p.out, "[gh-concurrency] progress: %s %d/%d skipped: %s (%d total jobs)\n",
+		progressBar(p.done, p.total, 24), p.done, p.total, repo, p.totalJobs)
+}
+
+func (p *progressReporter) Complete() {
+	if !p.enabled {
+		return
+	}
+	elapsed := time.Since(p.started).Round(time.Second)
+	fmt.Fprintf(p.out, "[gh-concurrency] complete: %d/%d repositories, %d jobs, %s elapsed\n",
+		p.done, p.total, p.totalJobs, elapsed)
+}
+
+func progressBar(done, total, width int) string {
+	if width < 1 {
+		width = 1
+	}
+	if total < 1 {
+		total = 1
+	}
+	if done < 0 {
+		done = 0
+	}
+	if done > total {
+		done = total
+	}
+	filled := int(math.Round(float64(done) / float64(total) * float64(width)))
+	if filled > width {
+		filled = width
+	}
+	return "[" + strings.Repeat("#", filled) + strings.Repeat("-", width-filled) + "]"
+}
+
 func (c *githubClient) paginate(path string, params url.Values, itemsKey string, handle func(json.RawMessage) error) error {
 	params = cloneValues(params)
 	params.Set("per_page", "100")
 	nextURL := c.baseURL + path + "?" + params.Encode()
+	page := 1
 	for nextURL != "" {
+		currentURL := nextURL
 		body, link, err := c.request(nextURL)
 		if err != nil {
 			return err
@@ -584,12 +729,17 @@ func (c *githubClient) paginate(path string, params url.Values, itemsKey string,
 		if err != nil {
 			return err
 		}
+		c.debugf("page %d %s returned %d items", page, requestURLForLog(currentURL), len(items))
 		for _, item := range items {
 			if err := handle(item); err != nil {
 				return err
 			}
 		}
 		nextURL = nextLink(link)
+		if nextURL != "" {
+			c.debugf("next page: %s", requestURLForLog(nextURL))
+		}
+		page++
 	}
 	return nil
 }
@@ -682,17 +832,23 @@ func collectJobs(client *githubClient, repo, since, until string) ([]record, err
 	}
 
 	var out []record
+	runCount := 0
+	jobCount := 0
+	client.logf("%s: listing workflow runs created %s", repo, created)
 	params := url.Values{"created": []string{created}}
 	err = client.paginate(repoPath+"/actions/runs", params, "workflow_runs", func(raw json.RawMessage) error {
 		var run workflowRun
 		if err := json.Unmarshal(raw, &run); err != nil {
 			return err
 		}
+		runCount++
+		client.debugf("%s: listing jobs for workflow run %d", repo, run.ID)
 		return client.paginate(repoPath+"/actions/runs/"+strconv.FormatInt(run.ID, 10)+"/jobs", nil, "jobs", func(rawJob json.RawMessage) error {
 			var job workflowJob
 			if err := json.Unmarshal(rawJob, &job); err != nil {
 				return err
 			}
+			jobCount++
 			rec, err := normalizeJob(job, repo)
 			if err != nil {
 				return err
@@ -706,6 +862,7 @@ func collectJobs(client *githubClient, repo, since, until string) ([]record, err
 	if err != nil {
 		return nil, err
 	}
+	client.logf("%s: %d workflow runs, %d workflow jobs, %d completed jobs used", repo, runCount, jobCount, len(out))
 	return out, nil
 }
 
@@ -934,6 +1091,7 @@ type report struct {
 	Tool                    string                  `json:"tool"`
 	Version                 string                  `json:"version"`
 	GeneratedAt             string                  `json:"generated_at"`
+	RuntimeSeconds          float64                 `json:"runtime_seconds"`
 	Parameters              parameters              `json:"parameters"`
 	JobsAnalyzed            int                     `json:"jobs_analyzed"`
 	BusyHours               float64                 `json:"busy_hours"`
@@ -944,7 +1102,7 @@ type report struct {
 	Warnings                []string                `json:"warnings"`
 }
 
-func buildReport(records []record, cfg config) report {
+func buildReport(records []record, cfg config, runtime time.Duration) report {
 	intervals := make([][2]time.Time, 0, len(records))
 	for _, rec := range records {
 		intervals = append(intervals, [2]time.Time{rec.Start, rec.End})
@@ -957,9 +1115,10 @@ func buildReport(records []record, cfg config) report {
 		busySeconds += seconds
 	}
 	return report{
-		Tool:        "gh-concurrency",
-		Version:     version,
-		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+		Tool:           "gh-concurrency",
+		Version:        version,
+		GeneratedAt:    time.Now().UTC().Format(time.RFC3339),
+		RuntimeSeconds: runtimeSeconds(runtime),
 		Parameters: parameters{
 			Repos:           cfg.repos,
 			Orgs:            cfg.orgs,
@@ -979,6 +1138,21 @@ func buildReport(records []record, cfg config) report {
 		QueueSeconds:            qstats,
 		Warnings:                detectWarnings(peak, pct, qstats),
 	}
+}
+
+func runtimeSeconds(runtime time.Duration) float64 {
+	if runtime < 0 {
+		runtime = 0
+	}
+	return math.Round(runtime.Seconds()*1000) / 1000
+}
+
+func formatRunDuration(runtimeSeconds float64) string {
+	if runtimeSeconds < 0 {
+		runtimeSeconds = 0
+	}
+	duration := time.Duration(runtimeSeconds * float64(time.Second)).Round(100 * time.Millisecond)
+	return duration.String()
 }
 
 func printText(out io.Writer, rep report) {
@@ -1001,6 +1175,7 @@ func printText(out io.Writer, rep report) {
 	fmt.Fprintf(out, "repo count: %d\n", p.RepositoryCount)
 	fmt.Fprintf(out, "window: %s -> %s   api: %s\n", p.Since, until, p.BaseURL)
 	fmt.Fprintf(out, "\nJobs analyzed:        %d\n", rep.JobsAnalyzed)
+	fmt.Fprintf(out, "Run time:             %s\n", formatRunDuration(rep.RuntimeSeconds))
 	fmt.Fprintf(out, "Busy wall-clock time: %.2fh (>=1 job running)\n", rep.BusyHours)
 	fmt.Fprintf(out, "Peak concurrency:     %d\n", rep.PeakConcurrency)
 	for _, key := range []string{"p50", "p90", "p95", "p99"} {
@@ -1070,6 +1245,7 @@ func comma(n int) string {
 }
 
 func run(argv []string, stdout, stderr io.Writer) int {
+	started := time.Now()
 	cfg, err := parseArgs(argv, stderr)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -1093,7 +1269,10 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	}
 
 	client := newGitHubClient(cfg.baseURL, token, cfg.maxRetries, cfg.verbose)
+	client.debug = cfg.debug
+	client.logWriter = stderr
 	client.requestDelay = time.Duration(cfg.requestDelayMS) * time.Millisecond
+	client.logf("resolving repository targets")
 	targetRepos, err := resolveTargetRepos(client, cfg, stderr)
 	if err != nil {
 		var ae authError
@@ -1108,11 +1287,14 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "error: no repositories matched the requested targets.")
 		return 1
 	}
+	client.logf("resolved %d repositories", len(targetRepos))
 	cfg.repos = targetRepos
 
 	var records []record
+	progress := newProgressReporter(stderr, cfg.verbose, len(cfg.repos))
+	progress.Begin()
 	for _, repo := range cfg.repos {
-		client.logf("fetching %s since %s", repo, cfg.since)
+		progress.Start(repo)
 		repoRecords, err := collectJobs(client, repo, cfg.since, cfg.until)
 		if err != nil {
 			var nf notFoundError
@@ -1120,6 +1302,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			switch {
 			case errors.As(err, &nf):
 				fmt.Fprintf(stderr, "warning: %s not found or no Actions access; skipping.\n", repo)
+				progress.Skip(repo)
 				continue
 			case errors.As(err, &ae):
 				fmt.Fprintln(stderr, "error: 401 unauthorized. Check token scope and validity.")
@@ -1130,14 +1313,16 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			}
 		}
 		records = append(records, repoRecords...)
+		progress.Done(repo, len(repoRecords))
 	}
+	progress.Complete()
 
 	if len(records) == 0 {
 		fmt.Fprintln(stderr, "error: no completed jobs found in that window.")
 		return 1
 	}
 
-	rep := buildReport(records, cfg)
+	rep := buildReport(records, cfg, time.Since(started))
 	if cfg.format == "json" {
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
