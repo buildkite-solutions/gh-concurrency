@@ -1,0 +1,5 @@
+# Deny everything, then allow only what the image needs. This keeps the build
+# context tiny and guarantees no stray .env, token file, or .git history can
+# leak into an image layer.
+*
+!gha_concurrency.py
