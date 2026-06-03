@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"mime"
@@ -44,16 +45,42 @@ type installationToken struct {
 	ExpiresAt string `json:"expires_at"`
 }
 
+var newGitHubHTTPClient = func() *http.Client {
+	return &http.Client{Timeout: 60 * time.Second}
+}
+
 func main() {
-	if err := run(); err != nil {
+	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
+type releaseOptions struct {
+	checkAuth bool
+}
+
+func parseReleaseOptions(args []string) (releaseOptions, error) {
+	var opts releaseOptions
+	flags := flag.NewFlagSet("github-release", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	flags.BoolVar(&opts.checkAuth, "check-auth", false, "validate GitHub App auth and exit")
+	if err := flags.Parse(args); err != nil {
+		return opts, err
+	}
+	if flags.NArg() > 0 {
+		return opts, fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
+	}
+	return opts, nil
+}
+
+func run(args []string) error {
+	opts, err := parseReleaseOptions(args)
+	if err != nil {
+		return err
+	}
 	version := firstEnv("VERSION", "RELEASE_TAG", "BUILDKITE_TAG")
-	if version == "" {
+	if !opts.checkAuth && version == "" {
 		return errors.New("VERSION, RELEASE_TAG, or BUILDKITE_TAG is required")
 	}
 	repo, err := releaseRepo()
@@ -63,13 +90,18 @@ func run() error {
 
 	client := &githubReleaseClient{
 		apiBase: strings.TrimRight(firstEnvOr("GITHUB_API_URL", "https://api.github.com"), "/"),
-		http:    &http.Client{Timeout: 60 * time.Second},
+		http:    newGitHubHTTPClient(),
 	}
 
 	token, err := client.githubAppInstallationToken(repo)
 	if err != nil {
-		return err
+		return fmt.Errorf("GitHub App auth is invalid: %w", err)
 	}
+	if opts.checkAuth {
+		fmt.Printf("GitHub App auth OK for %s\n", repo)
+		return nil
+	}
+
 	client.token = token
 
 	rel, err := client.releaseByTag(repo, version)

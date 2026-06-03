@@ -8,9 +8,21 @@ steps:
           version: 1.25.3
     command: "make test"
 
+  - label: ":github: Check GitHub release auth"
+    key: "github-release-auth"
+    depends_on: "test"
+    if: "build.tag =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+/ || build.env('RELEASE_TAG') =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+/"
+    secrets:
+      - GITHUB_APP_CLIENT_ID
+      - GITHUB_APP_PRIVATE_KEY_B64
+    plugins:
+      - setup-go#daa7af945245588f85b76ba7fe0a9af3d87dbf91:
+          version: 1.25.3
+    command: "scripts/publish-github-release.sh --check-auth"
+
   - label: ":package: Build gh extension binaries"
     key: "release-binaries"
-    depends_on: "test"
+    depends_on: "github-release-auth"
     if: "build.tag =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+/ || build.env('RELEASE_TAG') =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+/"
     plugins:
       - setup-go#daa7af945245588f85b76ba7fe0a9af3d87dbf91:
@@ -21,7 +33,7 @@ steps:
 
   - label: ":docker: Publish GHCR image"
     key: "docker"
-    depends_on: "test"
+    depends_on: "github-release-auth"
     if: "build.tag =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+/ || build.env('RELEASE_TAG') =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+/"
     secrets:
       - GHCR_USERNAME
