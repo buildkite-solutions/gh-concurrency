@@ -1,0 +1,3 @@
+* @buildkite-solutions/solutions
+/.github/CODEOWNERS @buildkite-solutions/solutions
+/.buildkite/ @buildkite-solutions/solutions
