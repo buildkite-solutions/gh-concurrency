@@ -1091,6 +1091,7 @@ type report struct {
 	Tool                    string                  `json:"tool"`
 	Version                 string                  `json:"version"`
 	GeneratedAt             string                  `json:"generated_at"`
+	RuntimeSeconds          float64                 `json:"runtime_seconds"`
 	Parameters              parameters              `json:"parameters"`
 	JobsAnalyzed            int                     `json:"jobs_analyzed"`
 	BusyHours               float64                 `json:"busy_hours"`
@@ -1101,7 +1102,7 @@ type report struct {
 	Warnings                []string                `json:"warnings"`
 }
 
-func buildReport(records []record, cfg config) report {
+func buildReport(records []record, cfg config, runtime time.Duration) report {
 	intervals := make([][2]time.Time, 0, len(records))
 	for _, rec := range records {
 		intervals = append(intervals, [2]time.Time{rec.Start, rec.End})
@@ -1114,9 +1115,10 @@ func buildReport(records []record, cfg config) report {
 		busySeconds += seconds
 	}
 	return report{
-		Tool:        "gh-concurrency",
-		Version:     version,
-		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
+		Tool:           "gh-concurrency",
+		Version:        version,
+		GeneratedAt:    time.Now().UTC().Format(time.RFC3339),
+		RuntimeSeconds: runtimeSeconds(runtime),
 		Parameters: parameters{
 			Repos:           cfg.repos,
 			Orgs:            cfg.orgs,
@@ -1136,6 +1138,21 @@ func buildReport(records []record, cfg config) report {
 		QueueSeconds:            qstats,
 		Warnings:                detectWarnings(peak, pct, qstats),
 	}
+}
+
+func runtimeSeconds(runtime time.Duration) float64 {
+	if runtime < 0 {
+		runtime = 0
+	}
+	return math.Round(runtime.Seconds()*1000) / 1000
+}
+
+func formatRunDuration(runtimeSeconds float64) string {
+	if runtimeSeconds < 0 {
+		runtimeSeconds = 0
+	}
+	duration := time.Duration(runtimeSeconds * float64(time.Second)).Round(100 * time.Millisecond)
+	return duration.String()
 }
 
 func printText(out io.Writer, rep report) {
@@ -1158,6 +1175,7 @@ func printText(out io.Writer, rep report) {
 	fmt.Fprintf(out, "repo count: %d\n", p.RepositoryCount)
 	fmt.Fprintf(out, "window: %s -> %s   api: %s\n", p.Since, until, p.BaseURL)
 	fmt.Fprintf(out, "\nJobs analyzed:        %d\n", rep.JobsAnalyzed)
+	fmt.Fprintf(out, "Run time:             %s\n", formatRunDuration(rep.RuntimeSeconds))
 	fmt.Fprintf(out, "Busy wall-clock time: %.2fh (>=1 job running)\n", rep.BusyHours)
 	fmt.Fprintf(out, "Peak concurrency:     %d\n", rep.PeakConcurrency)
 	for _, key := range []string{"p50", "p90", "p95", "p99"} {
@@ -1227,6 +1245,7 @@ func comma(n int) string {
 }
 
 func run(argv []string, stdout, stderr io.Writer) int {
+	started := time.Now()
 	cfg, err := parseArgs(argv, stderr)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -1303,7 +1322,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	rep := buildReport(records, cfg)
+	rep := buildReport(records, cfg, time.Since(started))
 	if cfg.format == "json" {
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")

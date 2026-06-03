@@ -177,6 +177,31 @@ func TestBillableMinutesSelfHostedIsFree(t *testing.T) {
 	}
 }
 
+func TestBuildReportIncludesRuntimeSeconds(t *testing.T) {
+	got := buildReport([]record{rec(60, "linux", false)}, config{
+		repos:   []string{"o/r"},
+		since:   "2025-05-01",
+		baseURL: defaultBaseURL,
+	}, 1500*time.Millisecond)
+	if got.RuntimeSeconds != 1.5 {
+		t.Fatalf("runtime_seconds = %v, want 1.5", got.RuntimeSeconds)
+	}
+}
+
+func TestPrintTextIncludesRunTime(t *testing.T) {
+	rep := buildReport([]record{rec(60, "linux", false)}, config{
+		repos:   []string{"o/r"},
+		since:   "2025-05-01",
+		baseURL: defaultBaseURL,
+	}, 2300*time.Millisecond)
+
+	var out bytes.Buffer
+	printText(&out, rep)
+	if !strings.Contains(out.String(), "Run time:             2.3s") {
+		t.Fatalf("output missing run time:\n%s", out.String())
+	}
+}
+
 func TestNextLinkPresent(t *testing.T) {
 	header := `<https://api.github.com/x?page=2>; rel="next", <https://api.github.com/x?page=9>; rel="last"`
 	got := nextLink(header)

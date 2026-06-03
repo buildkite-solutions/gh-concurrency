@@ -122,12 +122,16 @@ Repositories that are not found or not readable are skipped with a warning.
 ### Reading The Output
 
 ```text
+Jobs analyzed:        12,345
+Run time:             1m23.4s
 Peak concurrency:     42
 p95 concurrency:      18
 ```
 
 - Percentiles are time-weighted over busy time, when at least one job was
   running.
+- Run time is measured by the tool itself, so you do not need to wrap the
+  command in `time`.
 - Size toward p95/p99, not the absolute peak. One nightly fan-out should not
   make you pay for that slot all month.
 - The billable-minutes estimate re-derives GitHub-hosted Actions minutes by
