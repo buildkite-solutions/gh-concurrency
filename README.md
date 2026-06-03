@@ -32,6 +32,18 @@ gh concurrency --org owner --since 2025-05-01
 The extension uses your existing `gh auth login` session when no token is set.
 You can also provide `GITHUB_TOKEN`, `GH_TOKEN`, or `--token`.
 
+To upgrade after a new release:
+
+```bash
+gh extension upgrade concurrency
+
+# Or upgrade all installed gh extensions.
+gh extension upgrade --all
+```
+
+`gh` also checks for newer extension versions periodically when the extension
+runs and prints an upgrade notice when one is available.
+
 #### Docker
 
 ```bash
