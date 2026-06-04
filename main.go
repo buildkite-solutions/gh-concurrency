@@ -1294,13 +1294,24 @@ func formatRunDuration(runtimeSeconds float64) string {
 	return duration.String()
 }
 
+func displayVersion(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "dev"
+	}
+	if strings.HasPrefix(value, "v") || value == "dev" {
+		return value
+	}
+	return "v" + value
+}
+
 func printText(out io.Writer, rep report) {
 	p := rep.Parameters
 	until := p.Until
 	if until == "" {
 		until = "now"
 	}
-	fmt.Fprintf(out, "\ngh-concurrency v%s\n", rep.Version)
+	fmt.Fprintf(out, "\ngh-concurrency %s\n", displayVersion(rep.Version))
 	if len(p.Orgs) > 0 {
 		fmt.Fprintf(out, "orgs:   %s\n", strings.Join(p.Orgs, ", "))
 	}

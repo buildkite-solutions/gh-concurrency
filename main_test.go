@@ -202,6 +202,29 @@ func TestPrintTextIncludesRunTime(t *testing.T) {
 	}
 }
 
+func TestPrintTextDoesNotDoublePrefixTaggedVersion(t *testing.T) {
+	rep := report{
+		Version:               "v0.0.4",
+		Parameters:            parameters{Repos: []string{"o/r"}, RepositoryCount: 1, Since: "2025-05-01", BaseURL: defaultBaseURL},
+		PercentileConcurrency: map[string]int{"p50": 1, "p90": 1, "p95": 1, "p99": 1},
+	}
+
+	var out bytes.Buffer
+	printText(&out, rep)
+	if !strings.Contains(out.String(), "gh-concurrency v0.0.4\n") {
+		t.Fatalf("output missing single-prefixed version:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "gh-concurrency vv0.0.4") {
+		t.Fatalf("output double-prefixed version:\n%s", out.String())
+	}
+}
+
+func TestDisplayVersionPrefixesPlainSemver(t *testing.T) {
+	if got := displayVersion("0.0.4"); got != "v0.0.4" {
+		t.Fatalf("displayVersion = %q, want v0.0.4", got)
+	}
+}
+
 func TestRunnerPools(t *testing.T) {
 	records := []record{
 		{
