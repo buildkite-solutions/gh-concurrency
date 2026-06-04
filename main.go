@@ -35,21 +35,22 @@ var osMultiplier = map[string]int{
 }
 
 type config struct {
-	repos          []string
-	orgs           []string
-	repoFiles      []string
-	orgFiles       []string
-	repoType       string
-	since          string
-	until          string
-	baseURL        string
-	token          string
-	format         string
-	maxRetries     int
-	requestDelayMS int
-	verbose        bool
-	debug          bool
-	showVer        bool
+	repos           []string
+	orgs            []string
+	repoFiles       []string
+	orgFiles        []string
+	repoType        string
+	since           string
+	until           string
+	baseURL         string
+	token           string
+	format          string
+	maxRetries      int
+	requestDelayMS  int
+	includeArchived bool
+	verbose         bool
+	debug           bool
+	showVer         bool
 }
 
 type stringList []string
@@ -88,6 +89,7 @@ func parseArgs(argv []string, stderr io.Writer) (config, error) {
 	fs.StringVar(&cfg.format, "format", "text", "output format: text or json")
 	fs.IntVar(&cfg.maxRetries, "max-retries", 6, "maximum HTTP retry attempts")
 	fs.IntVar(&cfg.requestDelayMS, "request-delay-ms", 100, "minimum delay before each GitHub API request; helps avoid secondary rate limits")
+	fs.BoolVar(&cfg.includeArchived, "include-archived", false, "include archived repositories instead of skipping them during target resolution")
 	fs.BoolVar(&cfg.verbose, "verbose", false, "progress and rate-limit logging to stderr")
 	fs.BoolVar(&cfg.verbose, "v", false, "alias for --verbose")
 	fs.BoolVar(&cfg.debug, "debug", false, "HTTP request and pagination diagnostics to stderr; implies --verbose")
@@ -225,11 +227,12 @@ func parseListFile(contents string) []string {
 
 func resolveTargetRepos(client *githubClient, cfg config, stderr io.Writer) ([]string, error) {
 	var repos []string
+	var directRepos []string
 	for _, repo := range cfg.repos {
 		if err := validateRepo(repo); err != nil {
 			return nil, err
 		}
-		repos = append(repos, repo)
+		directRepos = append(directRepos, repo)
 	}
 
 	for _, path := range cfg.repoFiles {
@@ -241,9 +244,14 @@ func resolveTargetRepos(client *githubClient, cfg config, stderr io.Writer) ([]s
 			if err := validateRepo(repo); err != nil {
 				return nil, err
 			}
-			repos = append(repos, repo)
+			directRepos = append(directRepos, repo)
 		}
 	}
+	filteredDirectRepos, err := resolveDirectRepos(client, directRepos, cfg.includeArchived, stderr)
+	if err != nil {
+		return nil, err
+	}
+	repos = append(repos, filteredDirectRepos...)
 
 	orgs := append([]string{}, cfg.orgs...)
 	for _, path := range cfg.orgFiles {
@@ -261,7 +269,7 @@ func resolveTargetRepos(client *githubClient, cfg config, stderr io.Writer) ([]s
 
 	for _, org := range uniqueStrings(orgs) {
 		client.logf("listing repositories for org %s", org)
-		orgRepos, err := listOrgRepos(client, org, cfg.repoType)
+		orgRepos, err := listOrgRepos(client, org, cfg.repoType, cfg.includeArchived)
 		if err != nil {
 			var nf notFoundError
 			if errors.As(err, &nf) {
@@ -278,6 +286,38 @@ func resolveTargetRepos(client *githubClient, cfg config, stderr io.Writer) ([]s
 		return strings.ToLower(repos[i]) < strings.ToLower(repos[j])
 	})
 	return repos, nil
+}
+
+func resolveDirectRepos(client *githubClient, repos []string, includeArchived bool, stderr io.Writer) ([]string, error) {
+	if includeArchived {
+		return repos, nil
+	}
+	var out []string
+	for _, repo := range uniqueRepos(repos) {
+		client.logf("%s: checking repository metadata", repo)
+		info, err := getRepoInfo(client, repo)
+		if err != nil {
+			var nf notFoundError
+			if errors.As(err, &nf) {
+				fmt.Fprintf(stderr, "warning: %s not found or no repository access; skipping.\n", repo)
+				continue
+			}
+			return nil, err
+		}
+		if info.FullName == "" {
+			info.FullName = repo
+		}
+		if info.Disabled {
+			client.logf("skipping disabled repository %s", info.FullName)
+			continue
+		}
+		if info.Archived {
+			client.logf("skipping archived repository %s", info.FullName)
+			continue
+		}
+		out = append(out, info.FullName)
+	}
+	return out, nil
 }
 
 func uniqueStrings(values []string) []string {
@@ -316,12 +356,29 @@ func uniqueRepos(repos []string) []string {
 	return out
 }
 
-type orgRepo struct {
+type repositoryInfo struct {
 	FullName string `json:"full_name"`
 	Disabled bool   `json:"disabled"`
+	Archived bool   `json:"archived"`
 }
 
-func listOrgRepos(client *githubClient, org, repoType string) ([]string, error) {
+func getRepoInfo(client *githubClient, repo string) (repositoryInfo, error) {
+	repoPath, err := repoAPIPath(repo)
+	if err != nil {
+		return repositoryInfo{}, err
+	}
+	body, _, err := client.request(client.baseURL + repoPath)
+	if err != nil {
+		return repositoryInfo{}, err
+	}
+	var info repositoryInfo
+	if err := json.Unmarshal(body, &info); err != nil {
+		return repositoryInfo{}, err
+	}
+	return info, nil
+}
+
+func listOrgRepos(client *githubClient, org, repoType string, includeArchived bool) ([]string, error) {
 	if err := validateOrg(org); err != nil {
 		return nil, err
 	}
@@ -332,11 +389,11 @@ func listOrgRepos(client *githubClient, org, repoType string) ([]string, error) 
 	}
 	var repos []string
 	err := client.paginate("/orgs/"+url.PathEscape(org)+"/repos", params, "", func(raw json.RawMessage) error {
-		var repo orgRepo
+		var repo repositoryInfo
 		if err := json.Unmarshal(raw, &repo); err != nil {
 			return err
 		}
-		if repo.FullName == "" || repo.Disabled {
+		if repo.FullName == "" || repo.Disabled || (!includeArchived && repo.Archived) {
 			return nil
 		}
 		repos = append(repos, repo.FullName)
@@ -1218,6 +1275,7 @@ type parameters struct {
 	RepoFiles       []string `json:"repo_files,omitempty"`
 	OrgFiles        []string `json:"org_files,omitempty"`
 	RepoType        string   `json:"repo_type,omitempty"`
+	IncludeArchived bool     `json:"include_archived"`
 	RepositoryCount int      `json:"repository_count"`
 	Since           string   `json:"since"`
 	Until           string   `json:"until,omitempty"`
@@ -1263,6 +1321,7 @@ func buildReport(records []record, cfg config, runtime time.Duration) report {
 			RepoFiles:       cfg.repoFiles,
 			OrgFiles:        cfg.orgFiles,
 			RepoType:        cfg.repoType,
+			IncludeArchived: cfg.includeArchived,
 			RepositoryCount: len(cfg.repos),
 			Since:           cfg.since,
 			Until:           cfg.until,
@@ -1320,6 +1379,9 @@ func printText(out io.Writer, rep report) {
 	}
 	if len(p.OrgFiles) > 0 {
 		fmt.Fprintf(out, "org files:  %s\n", strings.Join(p.OrgFiles, ", "))
+	}
+	if p.IncludeArchived {
+		fmt.Fprintln(out, "archived repos: included")
 	}
 	fmt.Fprintf(out, "repos:  %s\n", summarizeRepos(p.Repos))
 	fmt.Fprintf(out, "repo count: %d\n", p.RepositoryCount)

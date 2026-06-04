@@ -373,6 +373,16 @@ func TestParseArgsVerboseAndDebugAliases(t *testing.T) {
 	}
 }
 
+func TestParseArgsIncludeArchived(t *testing.T) {
+	cfg, err := parseArgs([]string{"--repo", "o/r", "--since", "2025-05-01", "--include-archived"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.includeArchived {
+		t.Fatal("--include-archived did not enable archived repositories")
+	}
+}
+
 func TestProgressBar(t *testing.T) {
 	got := progressBar(3, 10, 10)
 	if got != "[###-------]" {
@@ -411,10 +421,20 @@ func TestResolveTargetReposExpandsOrgsAndFiles(t *testing.T) {
 	}
 
 	responses := map[string]fakeResponse{
+		"/repos/explicit/repo": {
+			body: map[string]any{"full_name": "explicit/repo"},
+		},
+		"/repos/file-org/file-repo": {
+			body: map[string]any{"full_name": "file-org/file-repo"},
+		},
+		"/repos/acme/api": {
+			body: map[string]any{"full_name": "acme/api"},
+		},
 		"/orgs/acme/repos": {
 			body: []map[string]any{
 				{"full_name": "acme/api"},
 				{"full_name": "acme/web"},
+				{"full_name": "acme/archived", "archived": true},
 				{"full_name": "acme/disabled", "disabled": true},
 			},
 		},
@@ -439,6 +459,59 @@ func TestResolveTargetReposExpandsOrgsAndFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := []string{"acme/api", "acme/web", "explicit/repo", "file-org/file-repo", "other/cli"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("resolveTargetRepos = %v, want %v", got, want)
+	}
+}
+
+func TestResolveTargetReposIncludesArchivedWhenRequested(t *testing.T) {
+	responses := map[string]fakeResponse{
+		"/orgs/acme/repos": {
+			body: []map[string]any{
+				{"full_name": "acme/archived", "archived": true},
+				{"full_name": "acme/web"},
+			},
+		},
+	}
+	client := newGitHubClient("https://api.github.com", "tok", 1, false)
+	client.httpClient = &http.Client{Transport: fakeTransport{responses: responses}}
+	client.sleep = func(time.Duration) {}
+
+	got, err := resolveTargetRepos(client, config{
+		orgs:            []string{"acme"},
+		repoType:        "all",
+		includeArchived: true,
+	}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"acme/archived", "acme/web"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("resolveTargetRepos = %v, want %v", got, want)
+	}
+}
+
+func TestResolveTargetReposSkipsArchivedDirectReposByDefault(t *testing.T) {
+	responses := map[string]fakeResponse{
+		"/repos/acme/live": {
+			body: map[string]any{"full_name": "acme/live"},
+		},
+		"/repos/acme/old": {
+			body: map[string]any{"full_name": "acme/old", "archived": true},
+		},
+	}
+	client := newGitHubClient("https://api.github.com", "tok", 1, false)
+	client.httpClient = &http.Client{Transport: fakeTransport{responses: responses}}
+	client.sleep = func(time.Duration) {}
+
+	got, err := resolveTargetRepos(client, config{
+		repos:    []string{"acme/live", "acme/old"},
+		repoType: "all",
+	}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"acme/live"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("resolveTargetRepos = %v, want %v", got, want)
 	}
