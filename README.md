@@ -138,6 +138,11 @@ Jobs analyzed:        12,345
 Run time:             1m23.4s
 Peak concurrency:     42
 p95 concurrency:      18
+
+Runner pools:
+  self-hosted/blacksmith        peak   48  p95   30     4,120 jobs
+  GitHub-hosted/linux           peak   12  p95    8       930 jobs
+  self-hosted/arc               peak    9  p95    6       310 jobs
 ```
 
 - Percentiles are time-weighted over busy time, when at least one job was
@@ -146,6 +151,10 @@ p95 concurrency:      18
   command in `time`.
 - Size toward p95/p99, not the absolute peak. One nightly fan-out should not
   make you pay for that slot all month.
+- Runner pools are derived from GitHub's workflow-job metadata. GitHub-hosted
+  jobs are grouped by OS; self-hosted and third-party runner platforms such as
+  Blacksmith, RunsOn, or ARC are grouped by runner group when GitHub reports
+  one, with a label-based fallback for common third-party runner labels.
 - The billable-minutes estimate re-derives GitHub-hosted Actions minutes by
   rounding each job up to the minute, then applying Linux x1, Windows x2, and
   macOS x10 multipliers. Self-hosted jobs are treated as free.
