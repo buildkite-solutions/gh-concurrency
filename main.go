@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -35,22 +36,29 @@ var osMultiplier = map[string]int{
 }
 
 type config struct {
-	repos           []string
-	orgs            []string
-	repoFiles       []string
-	orgFiles        []string
-	repoType        string
-	since           string
-	until           string
-	baseURL         string
-	token           string
-	format          string
-	maxRetries      int
-	requestDelayMS  int
-	includeArchived bool
-	verbose         bool
-	debug           bool
-	showVer         bool
+	repos               []string
+	orgs                []string
+	repoFiles           []string
+	orgFiles            []string
+	repoType            string
+	since               string
+	until               string
+	baseURL             string
+	token               string
+	format              string
+	maxRetries          int
+	requestDelayMS      int
+	apiWorkers          int
+	includeArchived     bool
+	includeInProgress   bool
+	jobFilter           string
+	branch              string
+	event               string
+	excludePullRequests bool
+	top                 int
+	verbose             bool
+	debug               bool
+	showVer             bool
 }
 
 type stringList []string
@@ -89,7 +97,14 @@ func parseArgs(argv []string, stderr io.Writer) (config, error) {
 	fs.StringVar(&cfg.format, "format", "text", "output format: text or json")
 	fs.IntVar(&cfg.maxRetries, "max-retries", 6, "maximum HTTP retry attempts")
 	fs.IntVar(&cfg.requestDelayMS, "request-delay-ms", 100, "minimum delay before each GitHub API request; helps avoid secondary rate limits")
+	fs.IntVar(&cfg.apiWorkers, "api-workers", 4, "maximum concurrent GitHub API requests")
 	fs.BoolVar(&cfg.includeArchived, "include-archived", false, "include archived repositories instead of skipping them during target resolution")
+	fs.BoolVar(&cfg.includeInProgress, "include-in-progress", false, "include non-completed workflow runs instead of querying only completed runs")
+	fs.StringVar(&cfg.jobFilter, "job-filter", "all", "workflow-run job filter: all or latest")
+	fs.StringVar(&cfg.branch, "branch", "", "only include workflow runs for this branch")
+	fs.StringVar(&cfg.event, "event", "", "only include workflow runs for this event, such as push or pull_request")
+	fs.BoolVar(&cfg.excludePullRequests, "exclude-pull-requests", false, "omit pull request workflow runs")
+	fs.IntVar(&cfg.top, "top", 10, "number of top repositories, workflows, and jobs to show")
 	fs.BoolVar(&cfg.verbose, "verbose", false, "progress and rate-limit logging to stderr")
 	fs.BoolVar(&cfg.verbose, "v", false, "alias for --verbose")
 	fs.BoolVar(&cfg.debug, "debug", false, "HTTP request and pagination diagnostics to stderr; implies --verbose")
@@ -109,6 +124,15 @@ func parseArgs(argv []string, stderr io.Writer) (config, error) {
 	}
 	if cfg.requestDelayMS < 0 {
 		cfg.requestDelayMS = 0
+	}
+	if cfg.apiWorkers < 1 {
+		cfg.apiWorkers = 1
+	}
+	if cfg.apiWorkers > 32 {
+		cfg.apiWorkers = 32
+	}
+	if cfg.top < 0 {
+		cfg.top = 0
 	}
 	if cfg.debug {
 		cfg.verbose = true
@@ -156,6 +180,9 @@ func validateConfig(cfg config) error {
 	}
 	if cfg.format != "text" && cfg.format != "json" {
 		return fmt.Errorf("invalid --format %q; expected text or json", cfg.format)
+	}
+	if cfg.jobFilter != "all" && cfg.jobFilter != "latest" {
+		return fmt.Errorf("invalid --job-filter %q; expected all or latest", cfg.jobFilter)
 	}
 	u, err := url.Parse(cfg.baseURL)
 	if err != nil || u.Scheme == "" || u.Host == "" {
@@ -225,12 +252,18 @@ func parseListFile(contents string) []string {
 	return values
 }
 
-func resolveTargetRepos(client *githubClient, cfg config, stderr io.Writer) ([]string, error) {
+type skippedRepository struct {
+	Repo   string `json:"repo"`
+	Reason string `json:"reason"`
+}
+
+func resolveTargetRepos(client *githubClient, cfg config, stderr io.Writer) ([]string, []skippedRepository, error) {
 	var repos []string
+	var skipped []skippedRepository
 	var directRepos []string
 	for _, repo := range cfg.repos {
 		if err := validateRepo(repo); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		directRepos = append(directRepos, repo)
 	}
@@ -238,30 +271,31 @@ func resolveTargetRepos(client *githubClient, cfg config, stderr io.Writer) ([]s
 	for _, path := range cfg.repoFiles {
 		fileRepos, err := readListFile(path)
 		if err != nil {
-			return nil, fmt.Errorf("read --repo-file %s: %w", path, err)
+			return nil, nil, fmt.Errorf("read --repo-file %s: %w", path, err)
 		}
 		for _, repo := range fileRepos {
 			if err := validateRepo(repo); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			directRepos = append(directRepos, repo)
 		}
 	}
-	filteredDirectRepos, err := resolveDirectRepos(client, directRepos, cfg.includeArchived, stderr)
+	filteredDirectRepos, directSkipped, err := resolveDirectRepos(client, directRepos, cfg.includeArchived, stderr)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	skipped = append(skipped, directSkipped...)
 	repos = append(repos, filteredDirectRepos...)
 
 	orgs := append([]string{}, cfg.orgs...)
 	for _, path := range cfg.orgFiles {
 		fileOrgs, err := readListFile(path)
 		if err != nil {
-			return nil, fmt.Errorf("read --org-file %s: %w", path, err)
+			return nil, nil, fmt.Errorf("read --org-file %s: %w", path, err)
 		}
 		for _, org := range fileOrgs {
 			if err := validateOrg(org); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 			orgs = append(orgs, org)
 		}
@@ -269,30 +303,33 @@ func resolveTargetRepos(client *githubClient, cfg config, stderr io.Writer) ([]s
 
 	for _, org := range uniqueStrings(orgs) {
 		client.logf("listing repositories for org %s", org)
-		orgRepos, err := listOrgRepos(client, org, cfg.repoType, cfg.includeArchived)
+		orgRepos, orgSkipped, err := listOrgRepos(client, org, cfg.repoType, cfg.includeArchived)
 		if err != nil {
 			var nf notFoundError
 			if errors.As(err, &nf) {
 				fmt.Fprintf(stderr, "warning: org %s not found or no repository access; skipping.\n", org)
 				continue
 			}
-			return nil, err
+			return nil, nil, err
 		}
 		repos = append(repos, orgRepos...)
+		skipped = append(skipped, orgSkipped...)
 	}
 
 	repos = uniqueRepos(repos)
 	sort.Slice(repos, func(i, j int) bool {
 		return strings.ToLower(repos[i]) < strings.ToLower(repos[j])
 	})
-	return repos, nil
+	sortSkippedRepositories(skipped)
+	return repos, skipped, nil
 }
 
-func resolveDirectRepos(client *githubClient, repos []string, includeArchived bool, stderr io.Writer) ([]string, error) {
+func resolveDirectRepos(client *githubClient, repos []string, includeArchived bool, stderr io.Writer) ([]string, []skippedRepository, error) {
 	if includeArchived {
-		return repos, nil
+		return repos, nil, nil
 	}
 	var out []string
+	var skipped []skippedRepository
 	for _, repo := range uniqueRepos(repos) {
 		client.logf("%s: checking repository metadata", repo)
 		info, err := getRepoInfo(client, repo)
@@ -300,24 +337,36 @@ func resolveDirectRepos(client *githubClient, repos []string, includeArchived bo
 			var nf notFoundError
 			if errors.As(err, &nf) {
 				fmt.Fprintf(stderr, "warning: %s not found or no repository access; skipping.\n", repo)
+				skipped = append(skipped, skippedRepository{Repo: repo, Reason: "not found or no repository access"})
 				continue
 			}
-			return nil, err
+			return nil, nil, err
 		}
 		if info.FullName == "" {
 			info.FullName = repo
 		}
 		if info.Disabled {
 			client.logf("skipping disabled repository %s", info.FullName)
+			skipped = append(skipped, skippedRepository{Repo: info.FullName, Reason: "disabled"})
 			continue
 		}
 		if info.Archived {
 			client.logf("skipping archived repository %s", info.FullName)
+			skipped = append(skipped, skippedRepository{Repo: info.FullName, Reason: "archived"})
 			continue
 		}
 		out = append(out, info.FullName)
 	}
-	return out, nil
+	return out, skipped, nil
+}
+
+func sortSkippedRepositories(skipped []skippedRepository) {
+	sort.Slice(skipped, func(i, j int) bool {
+		if strings.ToLower(skipped[i].Repo) != strings.ToLower(skipped[j].Repo) {
+			return strings.ToLower(skipped[i].Repo) < strings.ToLower(skipped[j].Repo)
+		}
+		return skipped[i].Reason < skipped[j].Reason
+	})
 }
 
 func uniqueStrings(values []string) []string {
@@ -378,9 +427,9 @@ func getRepoInfo(client *githubClient, repo string) (repositoryInfo, error) {
 	return info, nil
 }
 
-func listOrgRepos(client *githubClient, org, repoType string, includeArchived bool) ([]string, error) {
+func listOrgRepos(client *githubClient, org, repoType string, includeArchived bool) ([]string, []skippedRepository, error) {
 	if err := validateOrg(org); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	params := url.Values{
 		"type":      []string{repoType},
@@ -388,21 +437,30 @@ func listOrgRepos(client *githubClient, org, repoType string, includeArchived bo
 		"direction": []string{"asc"},
 	}
 	var repos []string
+	var skipped []skippedRepository
 	err := client.paginate("/orgs/"+url.PathEscape(org)+"/repos", params, "", func(raw json.RawMessage) error {
 		var repo repositoryInfo
 		if err := json.Unmarshal(raw, &repo); err != nil {
 			return err
 		}
-		if repo.FullName == "" || repo.Disabled || (!includeArchived && repo.Archived) {
+		if repo.FullName == "" {
+			return nil
+		}
+		if repo.Disabled {
+			skipped = append(skipped, skippedRepository{Repo: repo.FullName, Reason: "disabled"})
+			return nil
+		}
+		if !includeArchived && repo.Archived {
+			skipped = append(skipped, skippedRepository{Repo: repo.FullName, Reason: "archived"})
 			return nil
 		}
 		repos = append(repos, repo.FullName)
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return repos, nil
+	return repos, skipped, nil
 }
 
 func envToken() string {
@@ -453,17 +511,22 @@ func ghHostForBaseURL(baseURL string) string {
 }
 
 type githubClient struct {
-	baseURL      string
-	token        string
-	maxRetries   int
-	timeout      time.Duration
-	requestDelay time.Duration
-	verbose      bool
-	debug        bool
-	logWriter    io.Writer
-	httpClient   *http.Client
-	sleep        func(time.Duration)
-	now          func() time.Time
+	baseURL          string
+	token            string
+	maxRetries       int
+	timeout          time.Duration
+	requestDelay     time.Duration
+	apiSlots         chan struct{}
+	throttleMu       sync.Mutex
+	lastRequestStart time.Time
+	statsMu          sync.Mutex
+	stats            requestStats
+	verbose          bool
+	debug            bool
+	logWriter        io.Writer
+	httpClient       *http.Client
+	sleep            func(time.Duration)
+	now              func() time.Time
 }
 
 func newGitHubClient(baseURL, token string, maxRetries int, verbose bool) *githubClient {
@@ -472,12 +535,98 @@ func newGitHubClient(baseURL, token string, maxRetries int, verbose bool) *githu
 		token:      token,
 		maxRetries: maxRetries,
 		timeout:    30 * time.Second,
+		apiSlots:   make(chan struct{}, 1),
 		verbose:    verbose,
 		logWriter:  os.Stderr,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 		sleep:      time.Sleep,
 		now:        time.Now,
 	}
+}
+
+type requestStats struct {
+	Requests              int     `json:"api_requests"`
+	Retries               int     `json:"retries"`
+	RateLimitSleeps       int     `json:"rate_limit_sleeps"`
+	RateLimitSleepSeconds float64 `json:"rate_limit_sleep_seconds"`
+}
+
+func (c *githubClient) setAPIWorkers(workers int) {
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > 32 {
+		workers = 32
+	}
+	c.apiSlots = make(chan struct{}, workers)
+}
+
+func (c *githubClient) statsSnapshot() requestStats {
+	c.statsMu.Lock()
+	defer c.statsMu.Unlock()
+	out := c.stats
+	out.RateLimitSleepSeconds = math.Round(out.RateLimitSleepSeconds*1000) / 1000
+	return out
+}
+
+func (c *githubClient) recordRequest() {
+	c.statsMu.Lock()
+	c.stats.Requests++
+	c.statsMu.Unlock()
+}
+
+func (c *githubClient) recordRetry() {
+	c.statsMu.Lock()
+	c.stats.Retries++
+	c.statsMu.Unlock()
+}
+
+func (c *githubClient) recordRateLimitSleep(delay time.Duration) {
+	c.statsMu.Lock()
+	c.stats.RateLimitSleeps++
+	c.stats.RateLimitSleepSeconds += delay.Seconds()
+	c.statsMu.Unlock()
+}
+
+func (c *githubClient) acquireAPISlot() func() {
+	if c.apiSlots == nil {
+		return func() {}
+	}
+	c.apiSlots <- struct{}{}
+	return func() {
+		<-c.apiSlots
+	}
+}
+
+func (c *githubClient) waitForRequestStart() {
+	c.throttleMu.Lock()
+	defer c.throttleMu.Unlock()
+	if c.requestDelay > 0 && !c.lastRequestStart.IsZero() {
+		wait := c.lastRequestStart.Add(c.requestDelay).Sub(c.currentTime())
+		if wait > 0 {
+			c.sleep(wait)
+		}
+	}
+	c.lastRequestStart = c.currentTime()
+}
+
+func (c *githubClient) pauseRequests(delay time.Duration, reason string) {
+	if delay < time.Second {
+		delay = time.Second
+	}
+	c.throttleMu.Lock()
+	defer c.throttleMu.Unlock()
+	c.recordRateLimitSleep(delay)
+	c.logf("%s: pausing API requests for %.0fs", reason, delay.Seconds())
+	c.sleep(delay)
+	c.lastRequestStart = c.currentTime()
+}
+
+func (c *githubClient) currentTime() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
 }
 
 func (c *githubClient) logf(format string, args ...interface{}) {
@@ -502,8 +651,8 @@ func (c *githubClient) logOutput() io.Writer {
 func (c *githubClient) request(rawURL string) ([]byte, string, error) {
 	var lastErr error
 	for attempt := 0; attempt < c.maxRetries; attempt++ {
-		if c.requestDelay > 0 {
-			c.sleep(c.requestDelay)
+		if attempt > 0 {
+			c.recordRetry()
 		}
 		req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 		if err != nil {
@@ -515,8 +664,12 @@ func (c *githubClient) request(rawURL string) ([]byte, string, error) {
 		req.Header.Set("User-Agent", "gh-concurrency/"+version)
 
 		c.debugf("GET %s (attempt %d/%d)", requestURLForLog(rawURL), attempt+1, c.maxRetries)
+		release := c.acquireAPISlot()
+		c.waitForRequestStart()
+		c.recordRequest()
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
+			release()
 			lastErr = err
 			c.logf("network error: %v; retrying", err)
 			if attempt == c.maxRetries-1 {
@@ -529,6 +682,7 @@ func (c *githubClient) request(rawURL string) ([]byte, string, error) {
 
 		body, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
+		release()
 		if readErr != nil {
 			lastErr = readErr
 			if attempt == c.maxRetries-1 {
@@ -562,7 +716,7 @@ func (c *githubClient) request(rawURL string) ([]byte, string, error) {
 				delay, parseErr := strconv.Atoi(retryAfter)
 				if parseErr == nil && attempt < c.maxRetries-1 {
 					c.logf("%d: honoring Retry-After=%ds", resp.StatusCode, delay)
-					c.sleep(time.Duration(delay+1) * time.Second)
+					c.pauseRequests(time.Duration(delay+1)*time.Second, "Retry-After")
 					continue
 				}
 			}
@@ -657,7 +811,7 @@ func (c *githubClient) secondaryBackoff(attempt int) {
 	jitter := time.Duration(rand.Intn(5000)) * time.Millisecond
 	delay := base + jitter
 	c.logf("secondary rate limit: backing off %.0fs (attempt %d)", delay.Seconds(), attempt+1)
-	c.sleep(delay)
+	c.pauseRequests(delay, "secondary rate limit")
 }
 
 func isSecondaryRateLimit(status int, body []byte) bool {
@@ -672,15 +826,11 @@ func isSecondaryRateLimit(status int, body []byte) bool {
 }
 
 func (c *githubClient) sleepUntil(resetEpoch int64, reason string) {
-	wait := time.Until(time.Unix(resetEpoch, 0)) + time.Second
-	if c.now != nil {
-		wait = time.Unix(resetEpoch, 0).Sub(c.now()) + time.Second
-	}
+	wait := time.Unix(resetEpoch, 0).Sub(c.currentTime()) + time.Second
 	if wait < 0 {
 		wait = time.Second
 	}
-	c.logf("%s: sleeping %.0fs until window resets", reason, wait.Seconds())
-	c.sleep(wait)
+	c.pauseRequests(wait, reason)
 }
 
 func min(a, b int) int {
@@ -691,20 +841,22 @@ func min(a, b int) int {
 }
 
 type progressReporter struct {
+	mu        sync.Mutex
 	out       io.Writer
 	enabled   bool
 	total     int
+	started   int
 	done      int
 	totalJobs int
-	started   time.Time
+	startedAt time.Time
 }
 
 func newProgressReporter(out io.Writer, enabled bool, total int) *progressReporter {
 	return &progressReporter{
-		out:     out,
-		enabled: enabled && out != nil,
-		total:   total,
-		started: time.Now(),
+		out:       out,
+		enabled:   enabled && out != nil,
+		total:     total,
+		startedAt: time.Now(),
 	}
 }
 
@@ -712,6 +864,8 @@ func (p *progressReporter) Begin() {
 	if !p.enabled {
 		return
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	fmt.Fprintf(p.out, "[gh-concurrency] repositories queued: %d\n", p.total)
 	fmt.Fprintf(p.out, "[gh-concurrency] progress: %s 0/%d\n", progressBar(0, p.total, 24), p.total)
 }
@@ -720,13 +874,18 @@ func (p *progressReporter) Start(repo string) {
 	if !p.enabled {
 		return
 	}
-	fmt.Fprintf(p.out, "[gh-concurrency] examining repo %d/%d: %s\n", p.done+1, p.total, repo)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.started++
+	fmt.Fprintf(p.out, "[gh-concurrency] examining repo %d/%d: %s\n", p.started, p.total, repo)
 }
 
 func (p *progressReporter) Done(repo string, jobs int) {
 	if !p.enabled {
 		return
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.done++
 	p.totalJobs += jobs
 	fmt.Fprintf(p.out, "[gh-concurrency] progress: %s %d/%d done: %s (%d jobs, %d total)\n",
@@ -737,6 +896,8 @@ func (p *progressReporter) Skip(repo string) {
 	if !p.enabled {
 		return
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.done++
 	fmt.Fprintf(p.out, "[gh-concurrency] progress: %s %d/%d skipped: %s (%d total jobs)\n",
 		progressBar(p.done, p.total, 24), p.done, p.total, repo, p.totalJobs)
@@ -746,7 +907,9 @@ func (p *progressReporter) Complete() {
 	if !p.enabled {
 		return
 	}
-	elapsed := time.Since(p.started).Round(time.Second)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	elapsed := time.Since(p.startedAt).Round(time.Second)
 	fmt.Fprintf(p.out, "[gh-concurrency] complete: %d/%d repositories, %d jobs, %s elapsed\n",
 		p.done, p.total, p.totalJobs, elapsed)
 }
@@ -863,6 +1026,9 @@ type workflowRun struct {
 }
 
 type workflowJob struct {
+	Name            string   `json:"name"`
+	Conclusion      string   `json:"conclusion"`
+	WorkflowName    string   `json:"workflow_name"`
 	StartedAt       string   `json:"started_at"`
 	CompletedAt     string   `json:"completed_at"`
 	CreatedAt       string   `json:"created_at"`
@@ -873,6 +1039,9 @@ type workflowJob struct {
 
 type record struct {
 	Repo            string
+	WorkflowName    string
+	JobName         string
+	Conclusion      string
 	Start           time.Time
 	End             time.Time
 	QueueSeconds    *float64
@@ -883,49 +1052,164 @@ type record struct {
 	RunnerGroupName string
 }
 
-func collectJobs(client *githubClient, repo, since, until string) ([]record, error) {
-	created := ">=" + since
-	if until != "" {
-		created = since + ".." + until
-	}
+type collectOptions struct {
+	Since               string
+	Until               string
+	IncludeInProgress   bool
+	JobFilter           string
+	Branch              string
+	Event               string
+	ExcludePullRequests bool
+	APIWorkers          int
+}
+
+type repoScanResult struct {
+	Repo         string
+	Records      []record
+	WorkflowRuns int
+	WorkflowJobs int
+	JobsUsed     int
+}
+
+func collectJobs(client *githubClient, repo string, opts collectOptions) (repoScanResult, error) {
+	result := repoScanResult{Repo: repo}
+	created := createdQuery(opts.Since, opts.Until)
 	repoPath, err := repoAPIPath(repo)
 	if err != nil {
-		return nil, err
+		return result, err
 	}
 
-	var out []record
-	runCount := 0
-	jobCount := 0
 	client.logf("%s: listing workflow runs created %s", repo, created)
 	params := url.Values{"created": []string{created}}
+	if !opts.IncludeInProgress {
+		params.Set("status", "completed")
+	}
+	if opts.Branch != "" {
+		params.Set("branch", opts.Branch)
+	}
+	if opts.Event != "" {
+		params.Set("event", opts.Event)
+	}
+	if opts.ExcludePullRequests {
+		params.Set("exclude_pull_requests", "true")
+	}
+	var runs []workflowRun
 	err = client.paginate(repoPath+"/actions/runs", params, "workflow_runs", func(raw json.RawMessage) error {
 		var run workflowRun
 		if err := json.Unmarshal(raw, &run); err != nil {
 			return err
 		}
-		runCount++
-		client.debugf("%s: listing jobs for workflow run %d", repo, run.ID)
-		return client.paginate(repoPath+"/actions/runs/"+strconv.FormatInt(run.ID, 10)+"/jobs", nil, "jobs", func(rawJob json.RawMessage) error {
-			var job workflowJob
-			if err := json.Unmarshal(rawJob, &job); err != nil {
-				return err
-			}
-			jobCount++
-			rec, err := normalizeJob(job, repo)
-			if err != nil {
-				return err
-			}
-			if rec != nil {
-				out = append(out, *rec)
-			}
-			return nil
-		})
+		runs = append(runs, run)
+		return nil
 	})
 	if err != nil {
-		return nil, err
+		return result, err
 	}
-	client.logf("%s: %d workflow runs, %d workflow jobs, %d completed jobs used", repo, runCount, jobCount, len(out))
-	return out, nil
+	result.WorkflowRuns = len(runs)
+	if len(runs) == 0 {
+		client.logf("%s: 0 workflow runs, 0 workflow jobs, 0 completed jobs used", repo)
+		return result, nil
+	}
+
+	workers := boundedWorkerCount(opts.APIWorkers, len(runs))
+	runCh := make(chan workflowRun)
+	resultCh := make(chan repoScanResult, workers)
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for run := range runCh {
+				runResult, err := collectRunJobs(client, repo, repoPath, run.ID, opts.JobFilter)
+				if err != nil {
+					errCh <- err
+					continue
+				}
+				resultCh <- runResult
+			}
+		}()
+	}
+
+	go func() {
+		for _, run := range runs {
+			runCh <- run
+		}
+		close(runCh)
+		wg.Wait()
+		close(resultCh)
+		close(errCh)
+	}()
+
+	var firstErr error
+	for resultCh != nil || errCh != nil {
+		select {
+		case err, ok := <-errCh:
+			if !ok {
+				errCh = nil
+				continue
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
+		case runResult, ok := <-resultCh:
+			if !ok {
+				resultCh = nil
+				continue
+			}
+			result.WorkflowJobs += runResult.WorkflowJobs
+			result.JobsUsed += runResult.JobsUsed
+			result.Records = append(result.Records, runResult.Records...)
+		}
+	}
+	if firstErr != nil {
+		return result, firstErr
+	}
+
+	sortRecords(result.Records)
+	client.logf("%s: %d workflow runs, %d workflow jobs, %d completed jobs used", repo, result.WorkflowRuns, result.WorkflowJobs, result.JobsUsed)
+	return result, nil
+}
+
+func collectRunJobs(client *githubClient, repo, repoPath string, runID int64, jobFilter string) (repoScanResult, error) {
+	result := repoScanResult{Repo: repo}
+	client.debugf("%s: listing jobs for workflow run %d", repo, runID)
+	params := url.Values{"filter": []string{jobFilter}}
+	err := client.paginate(repoPath+"/actions/runs/"+strconv.FormatInt(runID, 10)+"/jobs", params, "jobs", func(rawJob json.RawMessage) error {
+		var job workflowJob
+		if err := json.Unmarshal(rawJob, &job); err != nil {
+			return err
+		}
+		result.WorkflowJobs++
+		rec, err := normalizeJob(job, repo)
+		if err != nil {
+			return err
+		}
+		if rec != nil {
+			result.JobsUsed++
+			result.Records = append(result.Records, *rec)
+		}
+		return nil
+	})
+	return result, err
+}
+
+func createdQuery(since, until string) string {
+	if until != "" {
+		return since + ".." + until
+	}
+	return ">=" + since
+}
+
+func boundedWorkerCount(workers, items int) int {
+	if workers < 1 {
+		workers = 1
+	}
+	if items > 0 && workers > items {
+		return items
+	}
+	return workers
 }
 
 func normalizeJob(job workflowJob, repo string) (*record, error) {
@@ -959,6 +1243,9 @@ func normalizeJob(job workflowJob, repo string) (*record, error) {
 
 	return &record{
 		Repo:            repo,
+		WorkflowName:    strings.TrimSpace(job.WorkflowName),
+		JobName:         strings.TrimSpace(job.Name),
+		Conclusion:      strings.TrimSpace(job.Conclusion),
 		Start:           start,
 		End:             end,
 		QueueSeconds:    queueSeconds,
@@ -1107,6 +1394,14 @@ type runnerPool struct {
 	RunnerGroupName       string         `json:"runner_group_name,omitempty"`
 }
 
+type usageSummary struct {
+	Name                  string         `json:"name"`
+	Jobs                  int            `json:"jobs"`
+	BusyHours             float64        `json:"busy_hours"`
+	PeakConcurrency       int            `json:"peak_concurrency"`
+	PercentileConcurrency map[string]int `json:"percentile_concurrency"`
+}
+
 type runnerPoolKey struct {
 	name            string
 	gitHubHosted    bool
@@ -1158,6 +1453,76 @@ func runnerPools(records []record) []runnerPool {
 		return strings.ToLower(pools[i].Name) < strings.ToLower(pools[j].Name)
 	})
 	return pools
+}
+
+func topUsageSummaries(records []record, top int, keyFor func(record) string) []usageSummary {
+	if top <= 0 {
+		return nil
+	}
+	grouped := map[string][]record{}
+	for _, rec := range records {
+		key := strings.TrimSpace(keyFor(rec))
+		if key == "" {
+			key = "unknown"
+		}
+		grouped[key] = append(grouped[key], rec)
+	}
+	summaries := make([]usageSummary, 0, len(grouped))
+	for name, groupRecords := range grouped {
+		summaries = append(summaries, summarizeUsage(name, groupRecords))
+	}
+	sort.Slice(summaries, func(i, j int) bool {
+		if summaries[i].BusyHours != summaries[j].BusyHours {
+			return summaries[i].BusyHours > summaries[j].BusyHours
+		}
+		if summaries[i].Jobs != summaries[j].Jobs {
+			return summaries[i].Jobs > summaries[j].Jobs
+		}
+		if summaries[i].PeakConcurrency != summaries[j].PeakConcurrency {
+			return summaries[i].PeakConcurrency > summaries[j].PeakConcurrency
+		}
+		return strings.ToLower(summaries[i].Name) < strings.ToLower(summaries[j].Name)
+	})
+	if len(summaries) > top {
+		summaries = summaries[:top]
+	}
+	return summaries
+}
+
+func summarizeUsage(name string, records []record) usageSummary {
+	intervals := make([][2]time.Time, 0, len(records))
+	for _, rec := range records {
+		intervals = append(intervals, [2]time.Time{rec.Start, rec.End})
+	}
+	peak, profile := concurrencyProfile(intervals)
+	pct := percentiles(profile, []int{50, 90, 95, 99})
+	busySeconds := 0.0
+	for _, seconds := range profile {
+		busySeconds += seconds
+	}
+	return usageSummary{
+		Name:                  name,
+		Jobs:                  len(records),
+		BusyHours:             math.Round((busySeconds/3600.0)*100) / 100,
+		PeakConcurrency:       peak,
+		PercentileConcurrency: map[string]int{"p50": pct[50], "p90": pct[90], "p95": pct[95], "p99": pct[99]},
+	}
+}
+
+func workflowSummaryName(rec record) string {
+	if rec.WorkflowName != "" {
+		return rec.WorkflowName
+	}
+	return "unknown workflow"
+}
+
+func jobSummaryName(rec record) string {
+	workflow := workflowSummaryName(rec)
+	job := rec.JobName
+	if job == "" {
+		job = "unknown job"
+	}
+	return workflow + " / " + job
 }
 
 func classifyRunnerPool(rec record) runnerPoolKey {
@@ -1231,6 +1596,145 @@ type queueStats struct {
 	MaxS    float64 `json:"max_s"`
 }
 
+type scanSummary struct {
+	RepositoriesQueued    int                 `json:"repositories_queued"`
+	RepositoriesScanned   int                 `json:"repositories_scanned"`
+	RepositoriesSkipped   int                 `json:"repositories_skipped"`
+	SkippedRepositories   []skippedRepository `json:"skipped_repositories,omitempty"`
+	WorkflowRuns          int                 `json:"workflow_runs"`
+	WorkflowJobs          int                 `json:"workflow_jobs"`
+	JobsUsed              int                 `json:"jobs_used"`
+	Conclusions           map[string]int      `json:"conclusions,omitempty"`
+	APIRequests           int                 `json:"api_requests"`
+	Retries               int                 `json:"retries"`
+	RateLimitSleeps       int                 `json:"rate_limit_sleeps"`
+	RateLimitSleepSeconds float64             `json:"rate_limit_sleep_seconds"`
+	RuntimeSeconds        float64             `json:"runtime_seconds"`
+}
+
+func collectRepositories(client *githubClient, repos []string, opts collectOptions, progress *progressReporter, skipped []skippedRepository, stderr io.Writer) ([]record, scanSummary, error) {
+	summary := scanSummary{
+		RepositoriesQueued:  len(repos),
+		SkippedRepositories: append([]skippedRepository{}, skipped...),
+		Conclusions:         map[string]int{},
+	}
+	workers := boundedWorkerCount(opts.APIWorkers, len(repos))
+	repoCh := make(chan string)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var records []record
+	var fatalErr error
+
+	setFatal := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if fatalErr == nil {
+			fatalErr = err
+		}
+	}
+	hasFatal := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return fatalErr != nil
+	}
+	addSkipped := func(repo, reason string) {
+		mu.Lock()
+		defer mu.Unlock()
+		summary.SkippedRepositories = append(summary.SkippedRepositories, skippedRepository{Repo: repo, Reason: reason})
+	}
+	addResult := func(result repoScanResult) {
+		mu.Lock()
+		defer mu.Unlock()
+		summary.RepositoriesScanned++
+		summary.WorkflowRuns += result.WorkflowRuns
+		summary.WorkflowJobs += result.WorkflowJobs
+		summary.JobsUsed += result.JobsUsed
+		for _, rec := range result.Records {
+			conclusion := rec.Conclusion
+			if conclusion == "" {
+				conclusion = "unknown"
+			}
+			summary.Conclusions[conclusion]++
+		}
+		records = append(records, result.Records...)
+	}
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for repo := range repoCh {
+				if hasFatal() {
+					continue
+				}
+				progress.Start(repo)
+				result, err := collectJobs(client, repo, opts)
+				if err != nil {
+					var nf notFoundError
+					var ae authError
+					switch {
+					case errors.As(err, &nf):
+						fmt.Fprintf(stderr, "warning: %s not found or no Actions access; skipping.\n", repo)
+						addSkipped(repo, "not found or no Actions access")
+						progress.Skip(repo)
+						continue
+					case errors.As(err, &ae):
+						setFatal(authError{})
+						continue
+					default:
+						setFatal(err)
+						continue
+					}
+				}
+				addResult(result)
+				progress.Done(repo, len(result.Records))
+			}
+		}()
+	}
+
+	for _, repo := range repos {
+		if hasFatal() {
+			break
+		}
+		repoCh <- repo
+	}
+	close(repoCh)
+	wg.Wait()
+
+	sortSkippedRepositories(summary.SkippedRepositories)
+	summary.RepositoriesSkipped = len(summary.SkippedRepositories)
+	if len(summary.Conclusions) == 0 {
+		summary.Conclusions = nil
+	}
+	sortRecords(records)
+
+	mu.Lock()
+	err := fatalErr
+	mu.Unlock()
+	if err != nil {
+		return nil, summary, err
+	}
+	return records, summary, nil
+}
+
+func sortRecords(records []record) {
+	sort.Slice(records, func(i, j int) bool {
+		if strings.ToLower(records[i].Repo) != strings.ToLower(records[j].Repo) {
+			return strings.ToLower(records[i].Repo) < strings.ToLower(records[j].Repo)
+		}
+		if !records[i].Start.Equal(records[j].Start) {
+			return records[i].Start.Before(records[j].Start)
+		}
+		if !records[i].End.Equal(records[j].End) {
+			return records[i].End.Before(records[j].End)
+		}
+		if records[i].WorkflowName != records[j].WorkflowName {
+			return records[i].WorkflowName < records[j].WorkflowName
+		}
+		return records[i].JobName < records[j].JobName
+	})
+}
+
 func computeQueueStats(records []record) *queueStats {
 	var qs []float64
 	for _, rec := range records {
@@ -1270,16 +1774,23 @@ func detectWarnings(peak int, pct map[int]int, qstats *queueStats) []string {
 }
 
 type parameters struct {
-	Repos           []string `json:"repos"`
-	Orgs            []string `json:"orgs,omitempty"`
-	RepoFiles       []string `json:"repo_files,omitempty"`
-	OrgFiles        []string `json:"org_files,omitempty"`
-	RepoType        string   `json:"repo_type,omitempty"`
-	IncludeArchived bool     `json:"include_archived"`
-	RepositoryCount int      `json:"repository_count"`
-	Since           string   `json:"since"`
-	Until           string   `json:"until,omitempty"`
-	BaseURL         string   `json:"base_url"`
+	Repos               []string `json:"repos"`
+	Orgs                []string `json:"orgs,omitempty"`
+	RepoFiles           []string `json:"repo_files,omitempty"`
+	OrgFiles            []string `json:"org_files,omitempty"`
+	RepoType            string   `json:"repo_type,omitempty"`
+	IncludeArchived     bool     `json:"include_archived"`
+	RepositoryCount     int      `json:"repository_count"`
+	Since               string   `json:"since"`
+	Until               string   `json:"until,omitempty"`
+	BaseURL             string   `json:"base_url"`
+	APIWorkers          int      `json:"api_workers"`
+	RunStatus           string   `json:"run_status"`
+	JobFilter           string   `json:"job_filter"`
+	Branch              string   `json:"branch,omitempty"`
+	Event               string   `json:"event,omitempty"`
+	ExcludePullRequests bool     `json:"exclude_pull_requests"`
+	Top                 int      `json:"top"`
 }
 
 type report struct {
@@ -1288,17 +1799,21 @@ type report struct {
 	GeneratedAt             string                  `json:"generated_at"`
 	RuntimeSeconds          float64                 `json:"runtime_seconds"`
 	Parameters              parameters              `json:"parameters"`
+	Scan                    scanSummary             `json:"scan"`
 	JobsAnalyzed            int                     `json:"jobs_analyzed"`
 	BusyHours               float64                 `json:"busy_hours"`
 	PeakConcurrency         int                     `json:"peak_concurrency"`
 	PercentileConcurrency   map[string]int          `json:"percentile_concurrency"`
 	RunnerPools             []runnerPool            `json:"runner_pools"`
+	TopRepositories         []usageSummary          `json:"top_repositories,omitempty"`
+	TopWorkflows            []usageSummary          `json:"top_workflows,omitempty"`
+	TopJobs                 []usageSummary          `json:"top_jobs,omitempty"`
 	BillableMinutesEstimate map[string]billableSlot `json:"billable_minutes_estimate"`
 	QueueSeconds            *queueStats             `json:"queue_seconds"`
 	Warnings                []string                `json:"warnings"`
 }
 
-func buildReport(records []record, cfg config, runtime time.Duration) report {
+func buildReport(records []record, cfg config, runtime time.Duration, summary scanSummary, stats requestStats) report {
 	intervals := make([][2]time.Time, 0, len(records))
 	for _, rec := range records {
 		intervals = append(intervals, [2]time.Time{rec.Start, rec.End})
@@ -1310,32 +1825,56 @@ func buildReport(records []record, cfg config, runtime time.Duration) report {
 	for _, seconds := range profile {
 		busySeconds += seconds
 	}
+	runtimeS := runtimeSeconds(runtime)
+	summary.APIRequests = stats.Requests
+	summary.Retries = stats.Retries
+	summary.RateLimitSleeps = stats.RateLimitSleeps
+	summary.RateLimitSleepSeconds = stats.RateLimitSleepSeconds
+	summary.RuntimeSeconds = runtimeS
 	return report{
 		Tool:           "gh-concurrency",
 		Version:        version,
 		GeneratedAt:    time.Now().UTC().Format(time.RFC3339),
-		RuntimeSeconds: runtimeSeconds(runtime),
+		RuntimeSeconds: runtimeS,
 		Parameters: parameters{
-			Repos:           cfg.repos,
-			Orgs:            cfg.orgs,
-			RepoFiles:       cfg.repoFiles,
-			OrgFiles:        cfg.orgFiles,
-			RepoType:        cfg.repoType,
-			IncludeArchived: cfg.includeArchived,
-			RepositoryCount: len(cfg.repos),
-			Since:           cfg.since,
-			Until:           cfg.until,
-			BaseURL:         cfg.baseURL,
+			Repos:               cfg.repos,
+			Orgs:                cfg.orgs,
+			RepoFiles:           cfg.repoFiles,
+			OrgFiles:            cfg.orgFiles,
+			RepoType:            cfg.repoType,
+			IncludeArchived:     cfg.includeArchived,
+			RepositoryCount:     len(cfg.repos),
+			Since:               cfg.since,
+			Until:               cfg.until,
+			BaseURL:             cfg.baseURL,
+			APIWorkers:          cfg.apiWorkers,
+			RunStatus:           runStatus(cfg),
+			JobFilter:           cfg.jobFilter,
+			Branch:              cfg.branch,
+			Event:               cfg.event,
+			ExcludePullRequests: cfg.excludePullRequests,
+			Top:                 cfg.top,
 		},
+		Scan:                    summary,
 		JobsAnalyzed:            len(records),
 		BusyHours:               math.Round((busySeconds/3600.0)*100) / 100,
 		PeakConcurrency:         peak,
 		PercentileConcurrency:   map[string]int{"p50": pct[50], "p90": pct[90], "p95": pct[95], "p99": pct[99]},
 		RunnerPools:             runnerPools(records),
+		TopRepositories:         topUsageSummaries(records, cfg.top, func(rec record) string { return rec.Repo }),
+		TopWorkflows:            topUsageSummaries(records, cfg.top, workflowSummaryName),
+		TopJobs:                 topUsageSummaries(records, cfg.top, jobSummaryName),
 		BillableMinutesEstimate: billableMinutes(records),
 		QueueSeconds:            qstats,
 		Warnings:                detectWarnings(peak, pct, qstats),
 	}
+}
+
+func runStatus(cfg config) string {
+	if cfg.includeInProgress {
+		return "all"
+	}
+	return "completed"
 }
 
 func runtimeSeconds(runtime time.Duration) float64 {
@@ -1386,6 +1925,17 @@ func printText(out io.Writer, rep report) {
 	fmt.Fprintf(out, "repos:  %s\n", summarizeRepos(p.Repos))
 	fmt.Fprintf(out, "repo count: %d\n", p.RepositoryCount)
 	fmt.Fprintf(out, "window: %s -> %s   api: %s\n", p.Since, until, p.BaseURL)
+	fmt.Fprintf(out, "filters: runs=%s jobs=%s workers=%d", p.RunStatus, p.JobFilter, p.APIWorkers)
+	if p.Branch != "" {
+		fmt.Fprintf(out, " branch=%s", p.Branch)
+	}
+	if p.Event != "" {
+		fmt.Fprintf(out, " event=%s", p.Event)
+	}
+	if p.ExcludePullRequests {
+		fmt.Fprint(out, " exclude_prs=true")
+	}
+	fmt.Fprintln(out)
 	fmt.Fprintf(out, "\nJobs analyzed:        %d\n", rep.JobsAnalyzed)
 	fmt.Fprintf(out, "Run time:             %s\n", formatRunDuration(rep.RuntimeSeconds))
 	fmt.Fprintf(out, "Busy wall-clock time: %.2fh (>=1 job running)\n", rep.BusyHours)
@@ -1393,6 +1943,8 @@ func printText(out io.Writer, rep report) {
 	for _, key := range []string{"p50", "p90", "p95", "p99"} {
 		fmt.Fprintf(out, "%s concurrency:       %d\n", key, rep.PercentileConcurrency[key])
 	}
+
+	printScanSummary(out, rep.Scan)
 
 	if len(rep.RunnerPools) > 0 {
 		fmt.Fprintln(out, "\nRunner pools:")
@@ -1407,6 +1959,10 @@ func printText(out io.Writer, rep report) {
 			)
 		}
 	}
+
+	printUsageSummaries(out, "Top repositories by busy time:", rep.TopRepositories)
+	printUsageSummaries(out, "Top workflows by busy time:", rep.TopWorkflows)
+	printUsageSummaries(out, "Top jobs by busy time:", rep.TopJobs)
 
 	if len(rep.BillableMinutesEstimate) > 0 {
 		fmt.Fprintln(out, "\nBillable-minutes estimate (sanity-check vs your invoice):")
@@ -1430,6 +1986,57 @@ func printText(out io.Writer, rep report) {
 	for _, warning := range rep.Warnings {
 		fmt.Fprintf(out, "\nWARNING: %s\n", warning)
 	}
+}
+
+func printScanSummary(out io.Writer, summary scanSummary) {
+	fmt.Fprintln(out, "\nScan summary:")
+	fmt.Fprintf(out, "  repositories: queued %d  scanned %d  skipped %d\n",
+		summary.RepositoriesQueued, summary.RepositoriesScanned, summary.RepositoriesSkipped)
+	fmt.Fprintf(out, "  workflow runs: %s  workflow jobs seen: %s  jobs used: %s\n",
+		comma(summary.WorkflowRuns), comma(summary.WorkflowJobs), comma(summary.JobsUsed))
+	fmt.Fprintf(out, "  API: %s requests  %s retries  %s rate-limit sleeps (%.1fs)\n",
+		comma(summary.APIRequests), comma(summary.Retries), comma(summary.RateLimitSleeps), summary.RateLimitSleepSeconds)
+	if len(summary.Conclusions) > 0 {
+		var parts []string
+		for _, key := range sortedStringKeys(summary.Conclusions) {
+			parts = append(parts, key+"="+comma(summary.Conclusions[key]))
+		}
+		fmt.Fprintf(out, "  conclusions: %s\n", strings.Join(parts, ", "))
+	}
+	if len(summary.SkippedRepositories) > 0 {
+		fmt.Fprintln(out, "  skipped repositories:")
+		for _, skipped := range summary.SkippedRepositories {
+			fmt.Fprintf(out, "    %s (%s)\n", skipped.Repo, skipped.Reason)
+		}
+	}
+}
+
+func printUsageSummaries(out io.Writer, title string, summaries []usageSummary) {
+	if len(summaries) == 0 {
+		return
+	}
+	fmt.Fprintf(out, "\n%s\n", title)
+	for _, summary := range summaries {
+		fmt.Fprintf(
+			out,
+			"  %-40s busy %7.2fh  peak %4d  p95 %4d  %8s jobs\n",
+			truncate(summary.Name, 40),
+			summary.BusyHours,
+			summary.PeakConcurrency,
+			summary.PercentileConcurrency["p95"],
+			comma(summary.Jobs),
+		)
+	}
+}
+
+func truncate(value string, max int) string {
+	if max < 1 || len(value) <= max {
+		return value
+	}
+	if max <= 3 {
+		return value[:max]
+	}
+	return value[:max-3] + "..."
 }
 
 func summarizeRepos(repos []string) string {
@@ -1495,11 +2102,12 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	}
 
 	client := newGitHubClient(cfg.baseURL, token, cfg.maxRetries, cfg.verbose)
+	client.setAPIWorkers(cfg.apiWorkers)
 	client.debug = cfg.debug
 	client.logWriter = stderr
 	client.requestDelay = time.Duration(cfg.requestDelayMS) * time.Millisecond
 	client.logf("resolving repository targets")
-	targetRepos, err := resolveTargetRepos(client, cfg, stderr)
+	targetRepos, skippedRepos, err := resolveTargetRepos(client, cfg, stderr)
 	if err != nil {
 		var ae authError
 		if errors.As(err, &ae) {
@@ -1516,39 +2124,35 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	client.logf("resolved %d repositories", len(targetRepos))
 	cfg.repos = targetRepos
 
-	var records []record
 	progress := newProgressReporter(stderr, cfg.verbose, len(cfg.repos))
 	progress.Begin()
-	for _, repo := range cfg.repos {
-		progress.Start(repo)
-		repoRecords, err := collectJobs(client, repo, cfg.since, cfg.until)
-		if err != nil {
-			var nf notFoundError
-			var ae authError
-			switch {
-			case errors.As(err, &nf):
-				fmt.Fprintf(stderr, "warning: %s not found or no Actions access; skipping.\n", repo)
-				progress.Skip(repo)
-				continue
-			case errors.As(err, &ae):
-				fmt.Fprintln(stderr, "error: 401 unauthorized. Check token scope and validity.")
-				return 1
-			default:
-				fmt.Fprintf(stderr, "error: %v\n", err)
-				return 1
-			}
-		}
-		records = append(records, repoRecords...)
-		progress.Done(repo, len(repoRecords))
-	}
+	records, summary, err := collectRepositories(client, cfg.repos, collectOptions{
+		Since:               cfg.since,
+		Until:               cfg.until,
+		IncludeInProgress:   cfg.includeInProgress,
+		JobFilter:           cfg.jobFilter,
+		Branch:              cfg.branch,
+		Event:               cfg.event,
+		ExcludePullRequests: cfg.excludePullRequests,
+		APIWorkers:          cfg.apiWorkers,
+	}, progress, skippedRepos, stderr)
 	progress.Complete()
+	if err != nil {
+		var ae authError
+		if errors.As(err, &ae) {
+			fmt.Fprintln(stderr, "error: 401 unauthorized. Check token scope and validity.")
+			return 1
+		}
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		return 1
+	}
 
 	if len(records) == 0 {
 		fmt.Fprintln(stderr, "error: no completed jobs found in that window.")
 		return 1
 	}
 
-	rep := buildReport(records, cfg, time.Since(started))
+	rep := buildReport(records, cfg, time.Since(started), summary, client.statsSnapshot())
 	if cfg.format == "json" {
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
