@@ -258,6 +258,86 @@ make release-binaries VERSION=v1.0.0
 ls dist/
 ```
 
+### Live Smoke Test Before Release
+
+Before pushing a new `v*` tag, test the local binary against a real test
+organization. Pick a small recent window first so failures are fast and you do
+not burn through API quota while iterating:
+
+```bash
+export TEST_GITHUB_ORG=your-test-org
+export TEST_SINCE=2025-05-01
+export TEST_UNTIL=2025-05-08
+
+make build
+
+./gh-concurrency \
+  --org "$TEST_GITHUB_ORG" \
+  --since "$TEST_SINCE" \
+  --until "$TEST_UNTIL" \
+  --repo-type sources \
+  --api-workers 4 \
+  --verbose
+```
+
+For a release-candidate check, capture JSON and compare serial vs parallel
+collection. The headline results should match; the scan API counters and run
+time will differ:
+
+```bash
+./gh-concurrency \
+  --org "$TEST_GITHUB_ORG" \
+  --since "$TEST_SINCE" \
+  --until "$TEST_UNTIL" \
+  --repo-type sources \
+  --api-workers 1 \
+  --format json \
+  > /tmp/gh-concurrency-serial.json
+
+./gh-concurrency \
+  --org "$TEST_GITHUB_ORG" \
+  --since "$TEST_SINCE" \
+  --until "$TEST_UNTIL" \
+  --repo-type sources \
+  --api-workers 4 \
+  --format json \
+  > /tmp/gh-concurrency-parallel.json
+```
+
+If `jq` is available, this is a quick sanity check:
+
+```bash
+jq '{jobs_analyzed, peak_concurrency, percentile_concurrency, scan}' \
+  /tmp/gh-concurrency-serial.json
+jq '{jobs_analyzed, peak_concurrency, percentile_concurrency, scan}' \
+  /tmp/gh-concurrency-parallel.json
+```
+
+To test the command exactly as a local `gh` extension, build the executable
+first, then install this checkout. GitHub CLI links local extensions to the
+root executable, so `make build` must happen before `gh extension install .`:
+
+```bash
+make build
+gh extension install . --force
+
+gh concurrency \
+  --org "$TEST_GITHUB_ORG" \
+  --since "$TEST_SINCE" \
+  --until "$TEST_UNTIL" \
+  --repo-type sources \
+  --api-workers 4 \
+  --verbose
+```
+
+If you replaced an installed release with the local checkout, restore the
+published extension after testing:
+
+```bash
+gh extension remove concurrency
+gh extension install buildkite-solutions/gh-concurrency
+```
+
 ### Release
 
 Releases are handled by Buildkite, not GitHub Actions.
