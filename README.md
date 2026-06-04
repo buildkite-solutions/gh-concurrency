@@ -96,6 +96,21 @@ narrower profile. Archived repositories are excluded by default so old projects
 do not add noise or workflow API requests; pass `--include-archived` if you
 intentionally want them in the profile.
 
+Use the workflow-run filters when a full organization scan is too broad:
+
+```bash
+# Only runs on main from push events.
+gh concurrency --org owner --since 2025-05-01 --branch main --event push
+
+# Omit pull request runs from the profile.
+gh concurrency --org owner --since 2025-05-01 --exclude-pull-requests
+```
+
+By default, the tool queries completed workflow runs and fetches all workflow
+run job attempts (`--job-filter all`). Use `--include-in-progress` to include
+queued/running workflow runs in the scan, or `--job-filter latest` if you only
+want the latest attempt for each workflow run.
+
 ### GitHub Enterprise Server
 
 Point the tool at your instance's API base:
@@ -141,10 +156,18 @@ Run time:             1m23.4s
 Peak concurrency:     42
 p95 concurrency:      18
 
+Scan summary:
+  repositories: queued 74  scanned 70  skipped 4
+  workflow runs: 3,210  workflow jobs seen: 12,800  jobs used: 12,345
+  API: 6,530 requests  2 retries  1 rate-limit sleeps (61.0s)
+
 Runner pools:
   self-hosted/blacksmith        peak   48  p95   30     4,120 jobs
   GitHub-hosted/linux           peak   12  p95    8       930 jobs
   self-hosted/arc               peak    9  p95    6       310 jobs
+
+Top repositories by busy time:
+  owner/api                                busy  123.45h  peak   12  p95    8     2,400 jobs
 ```
 
 - Percentiles are time-weighted over busy time, when at least one job was
@@ -162,6 +185,10 @@ Runner pools:
   macOS x10 multipliers. Self-hosted jobs are treated as free.
 - Queue-time warnings mean measured concurrency is probably a floor. If jobs
   waited in GitHub's queue, true demand was higher than observed concurrency.
+- The scan summary explains how much data was collected, which repositories
+  were skipped, and whether rate limits affected the run.
+- Top repositories, workflows, and jobs point at the biggest contributors to
+  busy time, so you can find the useful migration-sizing conversations faster.
 
 Use `--format json` for machine-readable output. Progress and diagnostics are
 written to stderr so they do not corrupt JSON:
@@ -175,10 +202,14 @@ gh concurrency --org owner --since 2025-05-01 --debug
 ```
 
 `-v` is an alias for `--verbose`; `-d` is an alias for `--debug`. Debug mode
-implies verbose mode. The tool runs requests sequentially, sleeps briefly
-before each request by default (`--request-delay-ms 100`), honors `Retry-After`,
-waits for primary rate-limit reset windows, and backs off for secondary
-rate-limit responses.
+implies verbose mode.
+
+The tool uses a conservative shared API worker pool by default
+(`--api-workers 4`). Every request goes through one global request-start delay
+(`--request-delay-ms 100`), honors `Retry-After`, waits for primary rate-limit
+reset windows, and backs off for secondary rate-limit responses. Increase
+`--api-workers` carefully for faster scans, or lower it to `1` for fully serial
+API access.
 
 ### Security Model
 

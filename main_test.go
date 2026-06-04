@@ -3,12 +3,15 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -179,10 +182,13 @@ func TestBillableMinutesSelfHostedIsFree(t *testing.T) {
 
 func TestBuildReportIncludesRuntimeSeconds(t *testing.T) {
 	got := buildReport([]record{rec(60, "linux", false)}, config{
-		repos:   []string{"o/r"},
-		since:   "2025-05-01",
-		baseURL: defaultBaseURL,
-	}, 1500*time.Millisecond)
+		repos:      []string{"o/r"},
+		since:      "2025-05-01",
+		baseURL:    defaultBaseURL,
+		apiWorkers: 4,
+		jobFilter:  "all",
+		top:        10,
+	}, 1500*time.Millisecond, scanSummary{}, requestStats{})
 	if got.RuntimeSeconds != 1.5 {
 		t.Fatalf("runtime_seconds = %v, want 1.5", got.RuntimeSeconds)
 	}
@@ -190,10 +196,13 @@ func TestBuildReportIncludesRuntimeSeconds(t *testing.T) {
 
 func TestPrintTextIncludesRunTime(t *testing.T) {
 	rep := buildReport([]record{rec(60, "linux", false)}, config{
-		repos:   []string{"o/r"},
-		since:   "2025-05-01",
-		baseURL: defaultBaseURL,
-	}, 2300*time.Millisecond)
+		repos:      []string{"o/r"},
+		since:      "2025-05-01",
+		baseURL:    defaultBaseURL,
+		apiWorkers: 4,
+		jobFilter:  "all",
+		top:        10,
+	}, 2300*time.Millisecond, scanSummary{}, requestStats{})
 
 	var out bytes.Buffer
 	printText(&out, rep)
@@ -306,6 +315,99 @@ func TestPrintTextIncludesRunnerPools(t *testing.T) {
 	}
 }
 
+func TestBuildReportIncludesScanSummaryAndTopSummaries(t *testing.T) {
+	records := []record{
+		{
+			Repo:         "o/api",
+			WorkflowName: "CI",
+			JobName:      "test",
+			Conclusion:   "success",
+			Start:        dt("10:00:00"),
+			End:          dt("10:20:00"),
+			OS:           "linux",
+		},
+		{
+			Repo:         "o/web",
+			WorkflowName: "Deploy",
+			JobName:      "ship",
+			Conclusion:   "failure",
+			Start:        dt("10:05:00"),
+			End:          dt("10:10:00"),
+			OS:           "linux",
+		},
+	}
+	rep := buildReport(records, config{
+		repos:               []string{"o/api", "o/web"},
+		since:               "2025-05-01",
+		baseURL:             defaultBaseURL,
+		apiWorkers:          4,
+		jobFilter:           "all",
+		branch:              "main",
+		event:               "push",
+		excludePullRequests: true,
+		top:                 1,
+	}, time.Second, scanSummary{
+		RepositoriesQueued:  2,
+		RepositoriesScanned: 2,
+		WorkflowRuns:        2,
+		WorkflowJobs:        2,
+		JobsUsed:            2,
+		Conclusions:         map[string]int{"success": 1, "failure": 1},
+	}, requestStats{Requests: 5, Retries: 1, RateLimitSleeps: 1, RateLimitSleepSeconds: 3})
+
+	if rep.Parameters.APIWorkers != 4 || rep.Parameters.RunStatus != "completed" || rep.Parameters.JobFilter != "all" || rep.Parameters.Branch != "main" || rep.Parameters.Event != "push" || !rep.Parameters.ExcludePullRequests {
+		t.Fatalf("parameters = %#v", rep.Parameters)
+	}
+	if rep.Scan.APIRequests != 5 || rep.Scan.Retries != 1 || rep.Scan.RateLimitSleeps != 1 || rep.Scan.RateLimitSleepSeconds != 3 {
+		t.Fatalf("scan API stats = %#v", rep.Scan)
+	}
+	if len(rep.TopRepositories) != 1 || rep.TopRepositories[0].Name != "o/api" {
+		t.Fatalf("top repositories = %#v, want o/api", rep.TopRepositories)
+	}
+	if len(rep.TopWorkflows) != 1 || rep.TopWorkflows[0].Name != "CI" {
+		t.Fatalf("top workflows = %#v, want CI", rep.TopWorkflows)
+	}
+	if len(rep.TopJobs) != 1 || rep.TopJobs[0].Name != "CI / test" {
+		t.Fatalf("top jobs = %#v, want CI / test", rep.TopJobs)
+	}
+}
+
+func TestPrintTextIncludesScanAndTopSummaries(t *testing.T) {
+	rep := report{
+		Version: "test",
+		Parameters: parameters{
+			Repos:           []string{"o/r"},
+			RepositoryCount: 1,
+			Since:           "2025-05-01",
+			BaseURL:         defaultBaseURL,
+			APIWorkers:      4,
+			RunStatus:       "completed",
+			JobFilter:       "all",
+			Top:             1,
+		},
+		Scan: scanSummary{
+			RepositoriesQueued:  1,
+			RepositoriesScanned: 1,
+			WorkflowRuns:        2,
+			WorkflowJobs:        3,
+			JobsUsed:            2,
+			APIRequests:         4,
+			Conclusions:         map[string]int{"success": 2},
+		},
+		PercentileConcurrency: map[string]int{"p50": 1, "p90": 1, "p95": 1, "p99": 1},
+		TopRepositories:       []usageSummary{{Name: "o/r", Jobs: 2, BusyHours: 0.5, PeakConcurrency: 1, PercentileConcurrency: map[string]int{"p95": 1}}},
+	}
+
+	var out bytes.Buffer
+	printText(&out, rep)
+	text := out.String()
+	for _, want := range []string{"Scan summary:", "API: 4 requests", "Top repositories by busy time:", "o/r"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("output missing %q:\n%s", want, text)
+		}
+	}
+}
+
 func TestClassifyRunnerPoolFallbacks(t *testing.T) {
 	unknownSelfHosted := classifyRunnerPool(record{SelfHosted: true, OS: "linux"})
 	if unknownSelfHosted.name != "self-hosted/unknown" {
@@ -383,6 +485,49 @@ func TestParseArgsIncludeArchived(t *testing.T) {
 	}
 }
 
+func TestParseArgsPerformanceAndFilterFlags(t *testing.T) {
+	cfg, err := parseArgs([]string{
+		"--repo", "o/r",
+		"--since", "2025-05-01",
+		"--api-workers", "8",
+		"--include-in-progress",
+		"--job-filter", "latest",
+		"--branch", "main",
+		"--event", "push",
+		"--exclude-pull-requests",
+		"--top", "3",
+	}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.apiWorkers != 8 || !cfg.includeInProgress || cfg.jobFilter != "latest" || cfg.branch != "main" || cfg.event != "push" || !cfg.excludePullRequests || cfg.top != 3 {
+		t.Fatalf("parsed cfg = %#v", cfg)
+	}
+}
+
+func TestParseArgsClampsWorkersAndTop(t *testing.T) {
+	cfg, err := parseArgs([]string{"--repo", "o/r", "--since", "2025-05-01", "--api-workers", "99", "--top", "-1"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.apiWorkers != 32 {
+		t.Fatalf("apiWorkers = %d, want 32", cfg.apiWorkers)
+	}
+	if cfg.top != 0 {
+		t.Fatalf("top = %d, want 0", cfg.top)
+	}
+}
+
+func TestValidateConfigRejectsInvalidJobFilter(t *testing.T) {
+	cfg, err := parseArgs([]string{"--repo", "o/r", "--since", "2025-05-01", "--job-filter", "bogus"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "--job-filter") {
+		t.Fatalf("validateConfig err = %v, want job-filter error", err)
+	}
+}
+
 func TestProgressBar(t *testing.T) {
 	got := progressBar(3, 10, 10)
 	if got != "[###-------]" {
@@ -448,7 +593,7 @@ func TestResolveTargetReposExpandsOrgsAndFiles(t *testing.T) {
 	client.httpClient = &http.Client{Transport: fakeTransport{responses: responses}}
 	client.sleep = func(time.Duration) {}
 
-	got, err := resolveTargetRepos(client, config{
+	got, skipped, err := resolveTargetRepos(client, config{
 		repos:     []string{"explicit/repo"},
 		orgs:      []string{"acme"},
 		repoFiles: []string{repoFile},
@@ -461,6 +606,9 @@ func TestResolveTargetReposExpandsOrgsAndFiles(t *testing.T) {
 	want := []string{"acme/api", "acme/web", "explicit/repo", "file-org/file-repo", "other/cli"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("resolveTargetRepos = %v, want %v", got, want)
+	}
+	if len(skipped) != 2 {
+		t.Fatalf("skipped = %v, want archived and disabled repos", skipped)
 	}
 }
 
@@ -477,7 +625,7 @@ func TestResolveTargetReposIncludesArchivedWhenRequested(t *testing.T) {
 	client.httpClient = &http.Client{Transport: fakeTransport{responses: responses}}
 	client.sleep = func(time.Duration) {}
 
-	got, err := resolveTargetRepos(client, config{
+	got, skipped, err := resolveTargetRepos(client, config{
 		orgs:            []string{"acme"},
 		repoType:        "all",
 		includeArchived: true,
@@ -488,6 +636,9 @@ func TestResolveTargetReposIncludesArchivedWhenRequested(t *testing.T) {
 	want := []string{"acme/archived", "acme/web"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("resolveTargetRepos = %v, want %v", got, want)
+	}
+	if len(skipped) != 0 {
+		t.Fatalf("skipped = %v, want empty", skipped)
 	}
 }
 
@@ -504,7 +655,7 @@ func TestResolveTargetReposSkipsArchivedDirectReposByDefault(t *testing.T) {
 	client.httpClient = &http.Client{Transport: fakeTransport{responses: responses}}
 	client.sleep = func(time.Duration) {}
 
-	got, err := resolveTargetRepos(client, config{
+	got, skipped, err := resolveTargetRepos(client, config{
 		repos:    []string{"acme/live", "acme/old"},
 		repoType: "all",
 	}, io.Discard)
@@ -514,6 +665,9 @@ func TestResolveTargetReposSkipsArchivedDirectReposByDefault(t *testing.T) {
 	want := []string{"acme/live"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("resolveTargetRepos = %v, want %v", got, want)
+	}
+	if len(skipped) != 1 || skipped[0].Repo != "acme/old" || skipped[0].Reason != "archived" {
+		t.Fatalf("skipped = %v, want acme/old archived", skipped)
 	}
 }
 
@@ -528,6 +682,9 @@ func TestPaginationAndCollectionOfflineReplay(t *testing.T) {
 					"started_at":        "2025-05-01T10:00:00Z",
 					"completed_at":      "2025-05-01T10:05:00Z",
 					"created_at":        "2025-05-01T09:59:00Z",
+					"name":              "test linux",
+					"workflow_name":     "CI",
+					"conclusion":        "success",
 					"labels":            []string{"ubuntu-latest"},
 					"runner_name":       "GitHub Actions 1",
 					"runner_group_name": "GitHub Actions",
@@ -540,6 +697,9 @@ func TestPaginationAndCollectionOfflineReplay(t *testing.T) {
 					"started_at":        "2025-05-01T10:02:00Z",
 					"completed_at":      "2025-05-01T10:08:00Z",
 					"created_at":        "2025-05-01T10:02:00Z",
+					"name":              "test windows",
+					"workflow_name":     "CI",
+					"conclusion":        "failure",
 					"labels":            []string{"self-hosted", "windows", "x64"},
 					"runner_name":       "blacksmith-1",
 					"runner_group_name": "blacksmith",
@@ -556,12 +716,16 @@ func TestPaginationAndCollectionOfflineReplay(t *testing.T) {
 	client.httpClient = &http.Client{Transport: fakeTransport{responses: responses}}
 	client.sleep = func(time.Duration) {}
 
-	records, err := collectJobs(client, "o/r", "2025-05-01", "")
+	result, err := collectJobs(client, "o/r", collectOptions{Since: "2025-05-01", JobFilter: "all", APIWorkers: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
+	records := result.Records
 	if len(records) != 2 {
 		t.Fatalf("records = %d, want 2", len(records))
+	}
+	if result.WorkflowRuns != 2 || result.WorkflowJobs != 3 || result.JobsUsed != 2 {
+		t.Fatalf("result stats = %#v, want 2 runs, 3 jobs, 2 used", result)
 	}
 	oses := map[string]bool{}
 	for _, rec := range records {
@@ -573,6 +737,9 @@ func TestPaginationAndCollectionOfflineReplay(t *testing.T) {
 	if records[1].RunnerName != "blacksmith-1" || records[1].RunnerGroupName != "blacksmith" || !records[1].SelfHosted {
 		t.Fatalf("runner metadata = %#v, want self-hosted blacksmith runner", records[1])
 	}
+	if records[1].WorkflowName != "CI" || records[1].JobName != "test windows" || records[1].Conclusion != "failure" {
+		t.Fatalf("job metadata = %#v, want parsed workflow/job/conclusion", records[1])
+	}
 	peak, _ := concurrencyProfile([][2]time.Time{
 		{records[0].Start, records[0].End},
 		{records[1].Start, records[1].End},
@@ -582,10 +749,164 @@ func TestPaginationAndCollectionOfflineReplay(t *testing.T) {
 	}
 }
 
+func TestCollectJobsPassesRunAndJobFilters(t *testing.T) {
+	var mu sync.Mutex
+	var checkErr error
+	setCheckErr := func(format string, args ...interface{}) {
+		mu.Lock()
+		defer mu.Unlock()
+		if checkErr == nil {
+			checkErr = fmt.Errorf(format, args...)
+		}
+	}
+	client := newGitHubClient("https://api.github.com", "tok", 1, false)
+	client.setAPIWorkers(2)
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		switch req.URL.Path {
+		case "/repos/o/r/actions/runs":
+			q := req.URL.Query()
+			for key, want := range map[string]string{
+				"created":               "2025-05-01..2025-05-02",
+				"status":                "completed",
+				"branch":                "main",
+				"event":                 "push",
+				"exclude_pull_requests": "true",
+				"per_page":              "100",
+			} {
+				if got := q.Get(key); got != want {
+					setCheckErr("runs query %s = %q, want %q (full query %s)", key, got, want, req.URL.RawQuery)
+				}
+			}
+			return fakeHTTPResponse(http.StatusOK, "200 OK", `{"workflow_runs":[{"id":1}]}`, nil), nil
+		case "/repos/o/r/actions/runs/1/jobs":
+			q := req.URL.Query()
+			if got := q.Get("filter"); got != "latest" {
+				setCheckErr("jobs filter = %q, want latest (full query %s)", got, req.URL.RawQuery)
+			}
+			return fakeHTTPResponse(http.StatusOK, "200 OK", `{"jobs":[]}`, nil), nil
+		default:
+			setCheckErr("unexpected path %s", req.URL.Path)
+			return fakeHTTPResponse(http.StatusNotFound, "404 Not Found", `{"message":"missing"}`, nil), nil
+		}
+	})}
+	client.sleep = func(time.Duration) {}
+
+	_, err := collectJobs(client, "o/r", collectOptions{
+		Since:               "2025-05-01",
+		Until:               "2025-05-02",
+		JobFilter:           "latest",
+		Branch:              "main",
+		Event:               "push",
+		ExcludePullRequests: true,
+		APIWorkers:          2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checkErr != nil {
+		t.Fatal(checkErr)
+	}
+}
+
+func TestCollectJobsOmitsStatusWhenIncludingInProgress(t *testing.T) {
+	client := newGitHubClient("https://api.github.com", "tok", 1, false)
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/repos/o/r/actions/runs" {
+			t.Fatalf("unexpected path %s", req.URL.Path)
+		}
+		if got := req.URL.Query().Get("status"); got != "" {
+			t.Fatalf("status = %q, want omitted", got)
+		}
+		return fakeHTTPResponse(http.StatusOK, "200 OK", `{"workflow_runs":[]}`, nil), nil
+	})}
+	client.sleep = func(time.Duration) {}
+
+	_, err := collectJobs(client, "o/r", collectOptions{Since: "2025-05-01", IncludeInProgress: true, JobFilter: "all", APIWorkers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCollectRepositoriesWorkerCountsProduceSameRecords(t *testing.T) {
+	responses := map[string]fakeResponse{
+		"/repos/o/api/actions/runs": {
+			body: map[string]any{"workflow_runs": []map[string]any{{"id": 1}}},
+		},
+		"/repos/o/api/actions/runs/1/jobs": {
+			body: map[string]any{"jobs": []map[string]any{{
+				"started_at":    "2025-05-01T10:00:00Z",
+				"completed_at":  "2025-05-01T10:10:00Z",
+				"created_at":    "2025-05-01T09:59:00Z",
+				"name":          "test",
+				"workflow_name": "CI",
+				"conclusion":    "success",
+				"labels":        []string{"ubuntu-latest"},
+			}}},
+		},
+		"/repos/o/web/actions/runs": {
+			body: map[string]any{"workflow_runs": []map[string]any{{"id": 2}}},
+		},
+		"/repos/o/web/actions/runs/2/jobs": {
+			body: map[string]any{"jobs": []map[string]any{{
+				"started_at":    "2025-05-01T10:05:00Z",
+				"completed_at":  "2025-05-01T10:15:00Z",
+				"created_at":    "2025-05-01T10:04:00Z",
+				"name":          "test",
+				"workflow_name": "CI",
+				"conclusion":    "success",
+				"labels":        []string{"ubuntu-latest"},
+			}}},
+		},
+	}
+
+	collect := func(workers int) ([]record, scanSummary) {
+		client := newGitHubClient("https://api.github.com", "tok", 1, false)
+		client.setAPIWorkers(workers)
+		client.httpClient = &http.Client{Transport: fakeTransport{responses: responses}}
+		client.sleep = func(time.Duration) {}
+		records, summary, err := collectRepositories(
+			client,
+			[]string{"o/api", "o/web"},
+			collectOptions{Since: "2025-05-01", JobFilter: "all", APIWorkers: workers},
+			newProgressReporter(io.Discard, false, 2),
+			nil,
+			io.Discard,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return records, summary
+	}
+
+	records1, summary1 := collect(1)
+	records4, summary4 := collect(4)
+	if recordSignature(records1) != recordSignature(records4) {
+		t.Fatalf("records differ:\nworkers=1 %s\nworkers=4 %s", recordSignature(records1), recordSignature(records4))
+	}
+	if summary1.WorkflowRuns != summary4.WorkflowRuns || summary1.WorkflowJobs != summary4.WorkflowJobs || summary1.JobsUsed != summary4.JobsUsed {
+		t.Fatalf("summaries differ: %#v vs %#v", summary1, summary4)
+	}
+}
+
+func recordSignature(records []record) string {
+	var parts []string
+	for _, rec := range records {
+		parts = append(parts, strings.Join([]string{
+			rec.Repo,
+			rec.WorkflowName,
+			rec.JobName,
+			rec.Start.Format(time.RFC3339),
+			rec.End.Format(time.RFC3339),
+		}, "|"))
+	}
+	return strings.Join(parts, "\n")
+}
+
 func TestSecondaryRateLimitBackoffRetries(t *testing.T) {
 	calls := 0
 	var sleeps []time.Duration
 	client := newGitHubClient("https://api.github.com", "tok", 2, false)
+	client.setAPIWorkers(2)
 	client.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 		calls++
 		if calls == 1 {
@@ -609,6 +930,115 @@ func TestSecondaryRateLimitBackoffRetries(t *testing.T) {
 	}
 	if len(sleeps) != 1 || sleeps[0] < time.Minute {
 		t.Fatalf("sleeps = %v, want one secondary backoff >= 1m", sleeps)
+	}
+	stats := client.statsSnapshot()
+	if stats.Requests != 2 || stats.Retries != 1 || stats.RateLimitSleeps != 1 {
+		t.Fatalf("stats = %#v, want 2 requests, 1 retry, 1 rate-limit sleep", stats)
+	}
+}
+
+func TestRetryAfterPausesSharedRequestGate(t *testing.T) {
+	headers := make(http.Header)
+	headers.Set("Retry-After", "2")
+
+	var mu sync.Mutex
+	calls := 0
+	client := newGitHubClient("https://api.github.com", "tok", 2, false)
+	client.setAPIWorkers(2)
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		mu.Lock()
+		calls++
+		call := calls
+		mu.Unlock()
+		if call == 1 {
+			return fakeHTTPResponse(http.StatusForbidden, "403 Forbidden", `{"message":"slow down"}`, headers), nil
+		}
+		return fakeHTTPResponse(http.StatusOK, "200 OK", `{"ok":true}`, nil), nil
+	})}
+
+	sleepStarted := make(chan struct{})
+	releaseSleep := make(chan struct{})
+	var sleepOnce sync.Once
+	client.sleep = func(d time.Duration) {
+		if d >= 3*time.Second {
+			sleepOnce.Do(func() { close(sleepStarted) })
+			<-releaseSleep
+		}
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, _, err := client.request("https://api.github.com/first")
+		firstDone <- err
+	}()
+	<-sleepStarted
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, _, err := client.request("https://api.github.com/second")
+		secondDone <- err
+	}()
+
+	select {
+	case err := <-secondDone:
+		t.Fatalf("second request completed during shared cooldown: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseSleep)
+
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondDone; err != nil {
+		t.Fatal(err)
+	}
+	stats := client.statsSnapshot()
+	if stats.RateLimitSleeps != 1 || stats.RateLimitSleepSeconds != 3 {
+		t.Fatalf("stats = %#v, want one 3s rate-limit sleep", stats)
+	}
+}
+
+func TestClientLimitsConcurrentRequests(t *testing.T) {
+	var mu sync.Mutex
+	inFlight := 0
+	maxInFlight := 0
+	client := newGitHubClient("https://api.github.com", "tok", 1, false)
+	client.setAPIWorkers(2)
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		mu.Lock()
+		inFlight++
+		if inFlight > maxInFlight {
+			maxInFlight = inFlight
+		}
+		mu.Unlock()
+
+		time.Sleep(20 * time.Millisecond)
+
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+		return fakeHTTPResponse(http.StatusOK, "200 OK", `{"ok":true}`, nil), nil
+	})}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, _, err := client.request("https://api.github.com/x/" + strconv.Itoa(i))
+			errs <- err
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if maxInFlight > 2 {
+		t.Fatalf("max in-flight requests = %d, want <= 2", maxInFlight)
 	}
 }
 
