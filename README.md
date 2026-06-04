@@ -92,7 +92,9 @@ owner-c/infra
 
 Organization scans use `--repo-type all` by default. Use `--repo-type sources`
 to exclude forks, or `public`, `private`, `forks`, or `member` when you need a
-narrower profile.
+narrower profile. Archived repositories are excluded by default so old projects
+do not add noise or workflow API requests; pass `--include-archived` if you
+intentionally want them in the profile.
 
 ### GitHub Enterprise Server
 
