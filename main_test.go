@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -505,6 +506,44 @@ func TestParseArgsPerformanceAndFilterFlags(t *testing.T) {
 	}
 }
 
+func TestParseArgsEstimateFlags(t *testing.T) {
+	cfg, err := parseArgs([]string{
+		"--repo", "o/r",
+		"--since", "2025-05-01",
+		"--estimate",
+		"--estimate-max-requests", "123",
+		"--estimate-min-remaining", "45",
+		"--estimate-sample-runs", "67",
+		"--estimate-iterations", "89",
+		"--estimate-confidence", "80",
+		"--estimate-seed", "42",
+	}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.estimate || cfg.estimateMaxRequests != 123 || cfg.estimateMinRemaining != 45 || cfg.estimateSampleRuns != 67 || cfg.estimateIterations != 89 || cfg.estimateConfidence != 80 || cfg.estimateSeed != 42 {
+		t.Fatalf("parsed estimate cfg = %#v", cfg)
+	}
+}
+
+func TestParseArgsClampsEstimateFlags(t *testing.T) {
+	cfg, err := parseArgs([]string{
+		"--repo", "o/r",
+		"--since", "2025-05-01",
+		"--estimate-max-requests", "0",
+		"--estimate-min-remaining", "-1",
+		"--estimate-sample-runs", "0",
+		"--estimate-iterations", "0",
+		"--estimate-confidence", "120",
+	}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.estimateMaxRequests != 1 || cfg.estimateMinRemaining != 0 || cfg.estimateSampleRuns != 1 || cfg.estimateIterations != 1 || cfg.estimateConfidence != 99 {
+		t.Fatalf("clamped estimate cfg = %#v", cfg)
+	}
+}
+
 func TestParseArgsClampsWorkersAndTop(t *testing.T) {
 	cfg, err := parseArgs([]string{"--repo", "o/r", "--since", "2025-05-01", "--api-workers", "99", "--top", "-1"}, io.Discard)
 	if err != nil {
@@ -824,6 +863,256 @@ func TestCollectJobsOmitsStatusWhenIncludingInProgress(t *testing.T) {
 	_, err := collectJobs(client, "o/r", collectOptions{Since: "2025-05-01", IncludeInProgress: true, JobFilter: "all", APIWorkers: 1})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestListWorkflowRunsForEstimateParsesTotalCount(t *testing.T) {
+	client := newGitHubClient("https://api.github.com", "tok", 1, false)
+	client.httpClient = &http.Client{Transport: fakeTransport{responses: map[string]fakeResponse{
+		"/repos/o/r/actions/runs": {
+			body: map[string]any{
+				"total_count": 5,
+				"workflow_runs": []map[string]any{{
+					"id":             1,
+					"name":           "CI",
+					"workflow_id":    99,
+					"event":          "push",
+					"head_branch":    "main",
+					"status":         "completed",
+					"conclusion":     "success",
+					"created_at":     "2025-05-01T09:59:00Z",
+					"run_started_at": "2025-05-01T10:00:00Z",
+					"updated_at":     "2025-05-01T10:10:00Z",
+				}},
+			},
+		},
+	}}}
+	client.sleep = func(time.Duration) {}
+
+	runs, total, complete, err := listWorkflowRunsForEstimate(client, "o/r", collectOptions{Since: "2025-05-01"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 5 || !complete || len(runs) != 1 {
+		t.Fatalf("runs/total/complete = %d/%d/%v, want 1/5/true", len(runs), total, complete)
+	}
+	if runs[0].Repo != "o/r" || runs[0].WorkflowID != 99 || runs[0].Event != "push" {
+		t.Fatalf("run = %#v", runs[0])
+	}
+}
+
+func TestSelectSampleRunsDeterministic(t *testing.T) {
+	var runs []workflowRun
+	for i := 0; i < 10; i++ {
+		runs = append(runs, workflowRun{
+			ID:           int64(i + 1),
+			Repo:         "o/r",
+			Name:         "CI",
+			WorkflowID:   1,
+			Event:        "push",
+			RunStartedAt: dt("10:00:00").Add(time.Duration(i) * time.Minute).Format(time.RFC3339),
+		})
+	}
+	a := selectSampleRuns(runs, 4, 42)
+	b := selectSampleRuns(runs, 4, 42)
+	c := selectSampleRuns(runs, 4, 43)
+	if workflowRunIDs(a) != workflowRunIDs(b) {
+		t.Fatalf("same seed produced different samples: %s vs %s", workflowRunIDs(a), workflowRunIDs(b))
+	}
+	if workflowRunIDs(a) == workflowRunIDs(c) {
+		t.Fatalf("different seed produced same sample: %s", workflowRunIDs(a))
+	}
+}
+
+func workflowRunIDs(runs []workflowRun) string {
+	var ids []string
+	for _, run := range runs {
+		ids = append(ids, strconv.FormatInt(run.ID, 10))
+	}
+	return strings.Join(ids, ",")
+}
+
+func TestRequestBudgetStopsBeforeMaxRequests(t *testing.T) {
+	client := newGitHubClient("https://api.github.com", "tok", 1, false)
+	client.enableRequestBudget(1, 0)
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return fakeHTTPResponse(http.StatusOK, "200 OK", `{"ok":true}`, nil), nil
+	})}
+	client.sleep = func(time.Duration) {}
+
+	if _, _, err := client.request("https://api.github.com/one"); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := client.request("https://api.github.com/two")
+	var stopErr requestBudgetStopError
+	if !errors.As(err, &stopErr) {
+		t.Fatalf("err = %v, want requestBudgetStopError", err)
+	}
+	if !strings.Contains(stopErr.Reason, "budget") {
+		t.Fatalf("stop reason = %q, want budget", stopErr.Reason)
+	}
+}
+
+func TestSimulateEstimateIntervalsContainExactSyntheticValue(t *testing.T) {
+	run1 := workflowRun{ID: 1, Repo: "o/r", Name: "CI", WorkflowID: 1, Event: "push", RunStartedAt: dt("10:00:00").Format(time.RFC3339)}
+	run2 := workflowRun{ID: 2, Repo: "o/r", Name: "CI", WorkflowID: 1, Event: "push", RunStartedAt: dt("10:05:00").Format(time.RFC3339)}
+	sampled := []sampledRun{{
+		Run: run1,
+		Records: []record{{
+			Repo:         "o/r",
+			WorkflowName: "CI",
+			JobName:      "test",
+			Start:        dt("10:00:00"),
+			End:          dt("10:10:00"),
+			OS:           "linux",
+		}},
+	}}
+	metrics, warnings := simulateEstimate([]workflowRun{run1, run2}, sampled, config{
+		estimateSeed:       7,
+		estimateIterations: 50,
+		estimateConfidence: 90,
+	})
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %v, want empty", warnings)
+	}
+	if metrics.JobsAnalyzed.Median != 2 {
+		t.Fatalf("jobs median = %v, want 2", metrics.JobsAnalyzed.Median)
+	}
+	if metrics.PeakConcurrency.Lower > 2 || metrics.PeakConcurrency.Upper < 2 {
+		t.Fatalf("peak interval = %#v, want to contain 2", metrics.PeakConcurrency)
+	}
+	if metrics.PercentileConcurrency["p95"].Lower > 2 || metrics.PercentileConcurrency["p95"].Upper < 2 {
+		t.Fatalf("p95 interval = %#v, want to contain 2", metrics.PercentileConcurrency["p95"])
+	}
+}
+
+func TestPrintTextEstimateModeIsProminent(t *testing.T) {
+	rep := report{
+		Version: "test",
+		Parameters: parameters{
+			Repos:           []string{"o/r"},
+			RepositoryCount: 1,
+			Since:           "2025-05-01",
+			BaseURL:         defaultBaseURL,
+			APIWorkers:      4,
+			RunStatus:       "completed",
+			JobFilter:       "all",
+			Mode:            "estimate",
+		},
+		Scan:                  scanSummary{RepositoriesQueued: 1, RepositoriesScanned: 1, WorkflowRuns: 10, WorkflowJobs: 5, JobsUsed: 5, APIRequests: 7},
+		PercentileConcurrency: map[string]int{"p50": 1, "p90": 2, "p95": 3, "p99": 4},
+		Estimate: &estimateReport{
+			Seed:        42,
+			Confidence:  90,
+			SampledRuns: 3,
+			KnownRuns:   10,
+			Warnings:    []string{"Peak concurrency is sensitive to rare unsampled fan-out; run exact mode before final commitments."},
+			Metrics: estimateMetrics{
+				JobsAnalyzed:    estimateInterval{Median: 12, Lower: 9, Upper: 20},
+				BusyHours:       estimateInterval{Median: 1.5, Lower: 1, Upper: 2},
+				PeakConcurrency: estimateInterval{Median: 4, Lower: 2, Upper: 8},
+				PercentileConcurrency: map[string]estimateInterval{
+					"p50": {Median: 1, Lower: 1, Upper: 2},
+					"p90": {Median: 2, Lower: 1, Upper: 4},
+					"p95": {Median: 3, Lower: 2, Upper: 5},
+					"p99": {Median: 4, Lower: 2, Upper: 8},
+				},
+			},
+		},
+	}
+	var out bytes.Buffer
+	printText(&out, rep)
+	text := out.String()
+	for _, want := range []string{"ESTIMATE MODE", "sampled 3 of 10", "Peak concurrency:     median 4 (90% range 2-8)", "not billing-grade exact"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("output missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestRunEstimateBuildsReportFromFakeAPI(t *testing.T) {
+	responses := map[string]fakeResponse{
+		"/repos/o/r/actions/runs": {
+			body: map[string]any{
+				"total_count": 2,
+				"workflow_runs": []map[string]any{
+					{"id": 1, "name": "CI", "workflow_id": 10, "event": "push", "conclusion": "success", "created_at": "2025-05-01T09:59:00Z", "run_started_at": "2025-05-01T10:00:00Z"},
+					{"id": 2, "name": "CI", "workflow_id": 10, "event": "push", "conclusion": "success", "created_at": "2025-05-01T10:04:00Z", "run_started_at": "2025-05-01T10:05:00Z"},
+				},
+			},
+		},
+		"/repos/o/r/actions/runs/1/jobs": {
+			body: map[string]any{"jobs": []map[string]any{{
+				"started_at":    "2025-05-01T10:00:00Z",
+				"completed_at":  "2025-05-01T10:10:00Z",
+				"created_at":    "2025-05-01T09:59:00Z",
+				"name":          "test",
+				"workflow_name": "CI",
+				"conclusion":    "success",
+				"labels":        []string{"ubuntu-latest"},
+			}}},
+		},
+		"/repos/o/r/actions/runs/2/jobs": {
+			body: map[string]any{"jobs": []map[string]any{{
+				"started_at":    "2025-05-01T10:05:00Z",
+				"completed_at":  "2025-05-01T10:15:00Z",
+				"created_at":    "2025-05-01T10:04:00Z",
+				"name":          "test",
+				"workflow_name": "CI",
+				"conclusion":    "success",
+				"labels":        []string{"ubuntu-latest"},
+			}}},
+		},
+	}
+	client := newGitHubClient("https://api.github.com", "tok", 1, false)
+	client.httpClient = &http.Client{Transport: fakeTransport{responses: responses}}
+	client.sleep = func(time.Duration) {}
+
+	rep, err := runEstimate(client, config{
+		repos:                []string{"o/r"},
+		since:                "2025-05-01",
+		baseURL:              defaultBaseURL,
+		apiWorkers:           1,
+		jobFilter:            "all",
+		estimate:             true,
+		estimateMaxRequests:  20,
+		estimateMinRemaining: 0,
+		estimateSampleRuns:   2,
+		estimateIterations:   20,
+		estimateConfidence:   90,
+		estimateSeed:         123,
+	}, nil, time.Now(), io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Parameters.Mode != "estimate" || rep.Estimate == nil {
+		t.Fatalf("report mode/estimate = %q/%#v", rep.Parameters.Mode, rep.Estimate)
+	}
+	if rep.Estimate.SampledRuns != 2 || rep.Estimate.KnownRuns != 2 || rep.Estimate.SampleFraction != 1 {
+		t.Fatalf("estimate summary = %#v", rep.Estimate)
+	}
+	if rep.Estimate.Metrics.PeakConcurrency.Median != 2 {
+		t.Fatalf("peak median = %v, want 2", rep.Estimate.Metrics.PeakConcurrency.Median)
+	}
+}
+
+func TestEstimateModeDoesNotSleepOnPrimaryRateLimit(t *testing.T) {
+	headers := make(http.Header)
+	headers.Set("X-RateLimit-Remaining", "0")
+	headers.Set("X-RateLimit-Reset", "9999999999")
+	client := newGitHubClient("https://api.github.com", "tok", 2, false)
+	client.enableRequestBudget(10, 0)
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return fakeHTTPResponse(http.StatusForbidden, "403 Forbidden", `{"message":"rate limit"}`, headers), nil
+	})}
+	client.sleep = func(d time.Duration) {
+		t.Fatalf("estimate mode should not sleep on rate-limit reset, slept %v", d)
+	}
+
+	_, _, err := client.request("https://api.github.com/x")
+	var stopErr requestBudgetStopError
+	if !errors.As(err, &stopErr) {
+		t.Fatalf("err = %v, want requestBudgetStopError", err)
 	}
 }
 

@@ -111,6 +111,49 @@ run job attempts (`--job-filter all`). Use `--include-in-progress` to include
 queued/running workflow runs in the scan, or `--job-filter latest` if you only
 want the latest attempt for each workflow run.
 
+### Fast Estimated Mode
+
+If an exact organization scan is too expensive for the current GitHub API
+budget, use `--estimate` for a fast first pass:
+
+```bash
+gh concurrency \
+  --org owner \
+  --since 2025-05-01 \
+  --repo-type sources \
+  --estimate
+```
+
+Estimated mode still resolves repositories exactly, then lists workflow runs
+and samples workflow-run jobs under a request budget. It builds reusable job
+shapes from sampled runs and runs a Monte Carlo simulation to produce intervals:
+
+```text
+ESTIMATE MODE: sampled 250 of 3,412 known workflow runs; 90% simulation interval; seed 12345
+
+Jobs analyzed:        median 12,340 (90% range 10,900-15,100)
+Peak concurrency:     median 146 (90% range 105-230)
+p95 concurrency:      median 30 (90% range 22-48)
+```
+
+Tune the request budget and reproducibility when needed:
+
+```bash
+gh concurrency \
+  --org owner \
+  --since 2025-05-01 \
+  --estimate \
+  --estimate-max-requests 750 \
+  --estimate-min-remaining 500 \
+  --estimate-sample-runs 200 \
+  --estimate-seed 12345
+```
+
+Estimated output is intentionally labeled as sampled simulation data. It is
+useful for sizing conversations and deciding whether a full exact scan is worth
+spending API quota on, but run exact mode before final commitments. Absolute
+peak concurrency is especially sensitive to rare unsampled fan-out.
+
 ### GitHub Enterprise Server
 
 Point the tool at your instance's API base:
