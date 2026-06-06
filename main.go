@@ -27,7 +27,13 @@ var (
 	date    = "unknown"
 )
 
-const defaultBaseURL = "https://api.github.com"
+const (
+	githubProvider         = "github"
+	circleCIProvider       = "circleci"
+	defaultProvider        = githubProvider
+	defaultBaseURL         = "https://api.github.com"
+	defaultCircleCIBaseURL = "https://circleci.com/api/v2"
+)
 
 var osMultiplier = map[string]int{
 	"linux":   1,
@@ -36,10 +42,17 @@ var osMultiplier = map[string]int{
 }
 
 type config struct {
+	providedFlags        map[string]bool
+	provider             string
 	repos                []string
 	orgs                 []string
 	repoFiles            []string
 	orgFiles             []string
+	circleCIProjects     []string
+	circleCIProjectFiles []string
+	circleCIVCS          string
+	circleCIJobDetails   bool
+	circleCIMaxPages     int
 	repoType             string
 	since                string
 	until                string
@@ -85,40 +98,44 @@ func parseArgs(argv []string, stderr io.Writer) (config, error) {
 	var orgs stringList
 	var repoFiles stringList
 	var orgFiles stringList
-	baseURL := os.Getenv("GITHUB_API_URL")
-	if baseURL == "" {
-		baseURL = defaultBaseURL
-	}
+	var circleCIProjects stringList
+	var circleCIProjectFiles stringList
 
 	fs := flag.NewFlagSet("gh-concurrency", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	fs.Var(&repos, "repo", "repository in OWNER/NAME form (repeatable; repos pool into one profile)")
-	fs.Var(&orgs, "org", "GitHub organization whose accessible repositories should be pooled (repeatable)")
+	fs.StringVar(&cfg.provider, "provider", defaultProvider, "CI provider: github or circleci")
+	fs.Var(&repos, "repo", "repository in OWNER/NAME form (GitHub) or mapped to VCS/OWNER/NAME (CircleCI; repeatable)")
+	fs.Var(&orgs, "org", "GitHub-only: organization whose accessible repositories should be pooled (repeatable)")
 	fs.Var(&repoFiles, "repo-file", "file containing OWNER/NAME repositories, one per line or comma/space separated (repeatable)")
-	fs.Var(&orgFiles, "org-file", "file containing organization names, one per line or comma/space separated (repeatable)")
-	fs.StringVar(&cfg.repoType, "repo-type", "all", "organization repository type: all, public, private, forks, sources, or member")
+	fs.Var(&orgFiles, "org-file", "GitHub-only: file containing organization names, one per line or comma/space separated (repeatable)")
+	fs.Var(&circleCIProjects, "circleci-project", "CircleCI-only: project slug in VCS/ORG/PROJECT form (repeatable; projects pool into one profile)")
+	fs.Var(&circleCIProjectFiles, "circleci-project-file", "CircleCI-only: file containing project slugs, one per line or comma/space separated (repeatable)")
+	fs.StringVar(&cfg.circleCIVCS, "circleci-vcs", "gh", "CircleCI-only: VCS slug used to map --repo OWNER/NAME")
+	fs.BoolVar(&cfg.circleCIJobDetails, "circleci-job-details", true, "CircleCI-only: fetch per-job details for resource class, executor, queue time, and parallelism")
+	fs.IntVar(&cfg.circleCIMaxPages, "circleci-max-pages", 0, "CircleCI-only: maximum pipeline pages to read per project; 0 means unlimited")
+	fs.StringVar(&cfg.repoType, "repo-type", "all", "GitHub-only: organization repository type: all, public, private, forks, sources, or member")
 	fs.StringVar(&cfg.since, "since", "", "lower bound on workflow-run creation date (YYYY-MM-DD)")
 	fs.StringVar(&cfg.until, "until", "", "optional upper bound on workflow-run creation date (YYYY-MM-DD)")
-	fs.StringVar(&cfg.baseURL, "base-url", baseURL, "API base URL. GHES: https://HOST/api/v3 (env: GITHUB_API_URL)")
-	fs.StringVar(&cfg.token, "token", envToken(), "GitHub token (default: GITHUB_TOKEN or GH_TOKEN; gh auth fallback when available)")
+	fs.StringVar(&cfg.baseURL, "base-url", "", "API base URL. GitHub default: GITHUB_API_URL or https://api.github.com; CircleCI default: CIRCLECI_API_URL or https://circleci.com/api/v2")
+	fs.StringVar(&cfg.token, "token", "", "API token. GitHub defaults to GITHUB_TOKEN/GH_TOKEN plus gh auth fallback; CircleCI defaults to CIRCLECI_TOKEN/CIRCLE_TOKEN")
 	fs.StringVar(&cfg.format, "format", "text", "output format: text or json")
 	fs.IntVar(&cfg.maxRetries, "max-retries", 6, "maximum HTTP retry attempts")
-	fs.IntVar(&cfg.requestDelayMS, "request-delay-ms", 100, "minimum delay before each GitHub API request; helps avoid secondary rate limits")
-	fs.IntVar(&cfg.apiWorkers, "api-workers", 4, "maximum concurrent GitHub API requests")
-	fs.BoolVar(&cfg.includeArchived, "include-archived", false, "include archived repositories instead of skipping them during target resolution")
-	fs.BoolVar(&cfg.includeInProgress, "include-in-progress", false, "include non-completed workflow runs instead of querying only completed runs")
-	fs.StringVar(&cfg.jobFilter, "job-filter", "all", "workflow-run job filter: all or latest")
-	fs.StringVar(&cfg.branch, "branch", "", "only include workflow runs for this branch")
-	fs.StringVar(&cfg.event, "event", "", "only include workflow runs for this event, such as push or pull_request")
-	fs.BoolVar(&cfg.excludePullRequests, "exclude-pull-requests", false, "omit pull request workflow runs")
+	fs.IntVar(&cfg.requestDelayMS, "request-delay-ms", 100, "minimum delay before each API request; helps avoid rate limits")
+	fs.IntVar(&cfg.apiWorkers, "api-workers", 4, "maximum concurrent API requests")
+	fs.BoolVar(&cfg.includeArchived, "include-archived", false, "GitHub-only: include archived repositories instead of skipping them during target resolution")
+	fs.BoolVar(&cfg.includeInProgress, "include-in-progress", false, "GitHub-only: include non-completed workflow runs instead of querying only completed runs")
+	fs.StringVar(&cfg.jobFilter, "job-filter", "all", "GitHub-only: workflow-run job filter: all or latest")
+	fs.StringVar(&cfg.branch, "branch", "", "only include runs for this branch")
+	fs.StringVar(&cfg.event, "event", "", "GitHub-only: only include workflow runs for this event, such as push or pull_request")
+	fs.BoolVar(&cfg.excludePullRequests, "exclude-pull-requests", false, "GitHub-only: omit pull request workflow runs")
 	fs.IntVar(&cfg.top, "top", 10, "number of top repositories, workflows, and jobs to show")
-	fs.BoolVar(&cfg.estimate, "estimate", false, "use sampled workflow-run jobs and simulation to estimate concurrency faster")
-	fs.IntVar(&cfg.estimateMaxRequests, "estimate-max-requests", 1000, "maximum GitHub API requests to spend in --estimate mode after target resolution")
-	fs.IntVar(&cfg.estimateMinRemaining, "estimate-min-remaining", 500, "stop --estimate mode before the primary rate-limit remaining count reaches this value")
-	fs.IntVar(&cfg.estimateSampleRuns, "estimate-sample-runs", 250, "target workflow runs to sample in --estimate mode")
-	fs.IntVar(&cfg.estimateIterations, "estimate-iterations", 1000, "Monte Carlo iterations for --estimate mode")
-	fs.IntVar(&cfg.estimateConfidence, "estimate-confidence", 90, "confidence interval percentage for --estimate mode")
-	fs.Int64Var(&cfg.estimateSeed, "estimate-seed", 0, "random seed for --estimate mode; default is generated and printed")
+	fs.BoolVar(&cfg.estimate, "estimate", false, "GitHub-only: use sampled workflow-run jobs and simulation to estimate concurrency faster")
+	fs.IntVar(&cfg.estimateMaxRequests, "estimate-max-requests", 1000, "GitHub estimate-only: maximum API requests to spend after target resolution")
+	fs.IntVar(&cfg.estimateMinRemaining, "estimate-min-remaining", 500, "GitHub estimate-only: stop before primary rate-limit remaining reaches this value")
+	fs.IntVar(&cfg.estimateSampleRuns, "estimate-sample-runs", 250, "GitHub estimate-only: target workflow runs to sample")
+	fs.IntVar(&cfg.estimateIterations, "estimate-iterations", 1000, "GitHub estimate-only: Monte Carlo iterations")
+	fs.IntVar(&cfg.estimateConfidence, "estimate-confidence", 90, "GitHub estimate-only: confidence interval percentage")
+	fs.Int64Var(&cfg.estimateSeed, "estimate-seed", 0, "GitHub estimate-only: random seed; default is generated and printed")
 	fs.BoolVar(&cfg.verbose, "verbose", false, "progress and rate-limit logging to stderr")
 	fs.BoolVar(&cfg.verbose, "v", false, "alias for --verbose")
 	fs.BoolVar(&cfg.debug, "debug", false, "HTTP request and pagination diagnostics to stderr; implies --verbose")
@@ -128,11 +145,18 @@ func parseArgs(argv []string, stderr io.Writer) (config, error) {
 	if err := fs.Parse(argv); err != nil {
 		return cfg, err
 	}
+	cfg.providedFlags = providedFlags(fs)
+	cfg.provider = normalizeProvider(cfg.provider)
 	cfg.repos = repos
 	cfg.orgs = orgs
 	cfg.repoFiles = repoFiles
 	cfg.orgFiles = orgFiles
-	cfg.baseURL = strings.TrimRight(cfg.baseURL, "/")
+	cfg.circleCIProjects = circleCIProjects
+	cfg.circleCIProjectFiles = circleCIProjectFiles
+	cfg.baseURL = strings.TrimRight(firstNonEmpty(cfg.baseURL, defaultBaseURLForProvider(cfg.provider)), "/")
+	if cfg.token == "" {
+		cfg.token = envTokenForProvider(cfg.provider)
+	}
 	if cfg.maxRetries < 1 {
 		cfg.maxRetries = 1
 	}
@@ -147,6 +171,9 @@ func parseArgs(argv []string, stderr io.Writer) (config, error) {
 	}
 	if cfg.top < 0 {
 		cfg.top = 0
+	}
+	if cfg.circleCIMaxPages < 0 {
+		cfg.circleCIMaxPages = 0
 	}
 	if cfg.estimateMaxRequests < 1 {
 		cfg.estimateMaxRequests = 1
@@ -172,12 +199,48 @@ func parseArgs(argv []string, stderr io.Writer) (config, error) {
 	return cfg, nil
 }
 
+func providedFlags(fs *flag.FlagSet) map[string]bool {
+	out := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) {
+		out[canonicalFlagName(f.Name)] = true
+	})
+	return out
+}
+
+func canonicalFlagName(name string) string {
+	switch name {
+	case "v":
+		return "verbose"
+	case "d":
+		return "debug"
+	default:
+		return name
+	}
+}
+
+func flagProvided(cfg config, name string) bool {
+	return cfg.providedFlags != nil && cfg.providedFlags[canonicalFlagName(name)]
+}
+
 func validateConfig(cfg config) error {
 	if cfg.showVer {
 		return nil
 	}
-	if len(cfg.repos) == 0 && len(cfg.orgs) == 0 && len(cfg.repoFiles) == 0 && len(cfg.orgFiles) == 0 {
+	cfg.provider = normalizeProvider(cfg.provider)
+	switch cfg.provider {
+	case githubProvider:
+	case circleCIProvider:
+	default:
+		return fmt.Errorf("invalid --provider %q; expected github or circleci", cfg.provider)
+	}
+	if err := validateFlagCompatibility(cfg); err != nil {
+		return err
+	}
+	if cfg.provider == githubProvider && len(cfg.repos) == 0 && len(cfg.orgs) == 0 && len(cfg.repoFiles) == 0 && len(cfg.orgFiles) == 0 {
 		return errors.New("at least one --repo, --org, --repo-file, or --org-file is required")
+	}
+	if cfg.provider == circleCIProvider && len(cfg.repos) == 0 && len(cfg.repoFiles) == 0 && len(cfg.circleCIProjects) == 0 && len(cfg.circleCIProjectFiles) == 0 {
+		return errors.New("at least one --repo, --repo-file, --circleci-project, or --circleci-project-file is required")
 	}
 	for _, repo := range cfg.repos {
 		if err := validateRepo(repo); err != nil {
@@ -189,25 +252,38 @@ func validateConfig(cfg config) error {
 			return err
 		}
 	}
+	for _, project := range cfg.circleCIProjects {
+		if err := validateCircleCIProject(project); err != nil {
+			return err
+		}
+	}
 	switch cfg.repoType {
 	case "all", "public", "private", "forks", "sources", "member":
 	default:
 		return fmt.Errorf("invalid --repo-type %q; expected all, public, private, forks, sources, or member", cfg.repoType)
 	}
-	for _, path := range append(append([]string{}, cfg.repoFiles...), cfg.orgFiles...) {
+	for _, path := range append(append(append([]string{}, cfg.repoFiles...), cfg.orgFiles...), cfg.circleCIProjectFiles...) {
 		if strings.TrimSpace(path) == "" {
 			return errors.New("target file path cannot be empty")
 		}
 	}
+	if (cfg.provider == circleCIProvider || flagProvided(cfg, "circleci-vcs")) && (strings.TrimSpace(cfg.circleCIVCS) == "" || strings.Contains(cfg.circleCIVCS, "/") || strings.ContainsAny(cfg.circleCIVCS, " \t\r\n")) {
+		return fmt.Errorf("invalid --circleci-vcs %q; expected a CircleCI VCS slug such as gh, bb, or circleci", cfg.circleCIVCS)
+	}
 	if cfg.since == "" {
 		return errors.New("--since YYYY-MM-DD is required")
 	}
-	if _, err := time.Parse("2006-01-02", cfg.since); err != nil {
+	since, err := time.Parse("2006-01-02", cfg.since)
+	if err != nil {
 		return fmt.Errorf("invalid --since %q; expected YYYY-MM-DD", cfg.since)
 	}
 	if cfg.until != "" {
-		if _, err := time.Parse("2006-01-02", cfg.until); err != nil {
+		until, err := time.Parse("2006-01-02", cfg.until)
+		if err != nil {
 			return fmt.Errorf("invalid --until %q; expected YYYY-MM-DD", cfg.until)
+		}
+		if until.Before(since) {
+			return fmt.Errorf("invalid --until %q; must be on or after --since %s", cfg.until, cfg.since)
 		}
 	}
 	if cfg.format != "text" && cfg.format != "json" {
@@ -221,6 +297,80 @@ func validateConfig(cfg config) error {
 		return fmt.Errorf("invalid --base-url %q", cfg.baseURL)
 	}
 	return nil
+}
+
+func validateFlagCompatibility(cfg config) error {
+	if cfg.provider == circleCIProvider {
+		if flagProvided(cfg, "include-in-progress") {
+			return errors.New("--include-in-progress is not supported for CircleCI because CircleCI concurrency requires stopped jobs")
+		}
+		if flagProvided(cfg, "estimate") {
+			return errors.New("--estimate is only supported with --provider github")
+		}
+		if err := rejectProvidedFlags(cfg, githubOnlyFlags(), "only applies with --provider github"); err != nil {
+			return err
+		}
+		if err := rejectProvidedFlags(cfg, estimateKnobFlags(), "only applies with --provider github and --estimate"); err != nil {
+			return err
+		}
+		if cfg.estimate {
+			return errors.New("--estimate is only supported with --provider github")
+		}
+		return nil
+	}
+
+	if err := rejectProvidedFlags(cfg, circleCIOnlyFlags(), "only applies with --provider circleci"); err != nil {
+		return err
+	}
+	if !cfg.estimate {
+		if err := rejectProvidedFlags(cfg, estimateKnobFlags(), "requires --estimate"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func rejectProvidedFlags(cfg config, flags []string, reason string) error {
+	for _, name := range flags {
+		if flagProvided(cfg, name) {
+			return fmt.Errorf("--%s %s", name, reason)
+		}
+	}
+	return nil
+}
+
+func githubOnlyFlags() []string {
+	return []string{
+		"org",
+		"org-file",
+		"repo-type",
+		"include-archived",
+		"include-in-progress",
+		"job-filter",
+		"event",
+		"exclude-pull-requests",
+	}
+}
+
+func circleCIOnlyFlags() []string {
+	return []string{
+		"circleci-project",
+		"circleci-project-file",
+		"circleci-vcs",
+		"circleci-job-details",
+		"circleci-max-pages",
+	}
+}
+
+func estimateKnobFlags() []string {
+	return []string{
+		"estimate-max-requests",
+		"estimate-min-remaining",
+		"estimate-sample-runs",
+		"estimate-iterations",
+		"estimate-confidence",
+		"estimate-seed",
+	}
 }
 
 func validateRepo(repo string) error {
@@ -240,6 +390,60 @@ func validateOrg(org string) error {
 		return fmt.Errorf("invalid org %q; expected organization slug", org)
 	}
 	return nil
+}
+
+func validateCircleCIProject(project string) error {
+	project = strings.TrimSpace(project)
+	if project == "" || strings.ContainsAny(project, " \t\r\n") {
+		return fmt.Errorf("invalid CircleCI project %q; expected VCS/ORG/PROJECT", project)
+	}
+	parts := strings.Split(project, "/")
+	if len(parts) != 3 {
+		return fmt.Errorf("invalid CircleCI project %q; expected VCS/ORG/PROJECT", project)
+	}
+	for _, part := range parts {
+		if part == "" {
+			return fmt.Errorf("invalid CircleCI project %q; expected VCS/ORG/PROJECT", project)
+		}
+	}
+	return nil
+}
+
+func normalizeProvider(provider string) string {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" {
+		return defaultProvider
+	}
+	return provider
+}
+
+func defaultBaseURLForProvider(provider string) string {
+	switch provider {
+	case circleCIProvider:
+		if baseURL := strings.TrimSpace(os.Getenv("CIRCLECI_API_URL")); baseURL != "" {
+			return baseURL
+		}
+		return defaultCircleCIBaseURL
+	default:
+		if baseURL := strings.TrimSpace(os.Getenv("GITHUB_API_URL")); baseURL != "" {
+			return baseURL
+		}
+		return defaultBaseURL
+	}
+}
+
+func envTokenForProvider(provider string) string {
+	switch provider {
+	case circleCIProvider:
+		for _, key := range []string{"CIRCLECI_TOKEN", "CIRCLE_TOKEN"} {
+			if token := strings.TrimSpace(os.Getenv(key)); token != "" {
+				return token
+			}
+		}
+		return ""
+	default:
+		return envToken()
+	}
 }
 
 func splitRepoName(repo string) (string, string, error) {
@@ -354,6 +558,71 @@ func resolveTargetRepos(client *githubClient, cfg config, stderr io.Writer) ([]s
 	})
 	sortSkippedRepositories(skipped)
 	return repos, skipped, nil
+}
+
+func resolveCircleCIProjects(cfg config) ([]string, error) {
+	var projects []string
+	for _, project := range cfg.circleCIProjects {
+		if err := validateCircleCIProject(project); err != nil {
+			return nil, err
+		}
+		projects = append(projects, project)
+	}
+	for _, path := range cfg.circleCIProjectFiles {
+		fileProjects, err := readListFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read --circleci-project-file %s: %w", path, err)
+		}
+		for _, project := range fileProjects {
+			if err := validateCircleCIProject(project); err != nil {
+				return nil, err
+			}
+			projects = append(projects, project)
+		}
+	}
+
+	for _, repo := range cfg.repos {
+		project, err := circleCIProjectFromRepo(cfg.circleCIVCS, repo)
+		if err != nil {
+			return nil, err
+		}
+		projects = append(projects, project)
+	}
+	for _, path := range cfg.repoFiles {
+		fileRepos, err := readListFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read --repo-file %s: %w", path, err)
+		}
+		for _, repo := range fileRepos {
+			project, err := circleCIProjectFromRepo(cfg.circleCIVCS, repo)
+			if err != nil {
+				return nil, err
+			}
+			projects = append(projects, project)
+		}
+	}
+
+	projects = uniqueStrings(projects)
+	sort.Slice(projects, func(i, j int) bool {
+		return strings.ToLower(projects[i]) < strings.ToLower(projects[j])
+	})
+	return projects, nil
+}
+
+func circleCIProjectFromRepo(vcs, repo string) (string, error) {
+	owner, name, err := splitRepoName(repo)
+	if err != nil {
+		return "", err
+	}
+	vcs = strings.TrimSpace(vcs)
+	if vcs == "" {
+		vcs = "gh"
+	}
+	project := vcs + "/" + owner + "/" + name
+	if err := validateCircleCIProject(project); err != nil {
+		return "", err
+	}
+	return project, nil
 }
 
 func resolveDirectRepos(client *githubClient, repos []string, includeArchived bool, stderr io.Writer) ([]string, []skippedRepository, error) {
@@ -504,11 +773,14 @@ func envToken() string {
 	return ""
 }
 
-func resolveToken(explicitToken, baseURL string) (string, error) {
-	if explicitToken != "" {
-		return explicitToken, nil
+func resolveToken(cfg config) (string, error) {
+	if cfg.token != "" {
+		return cfg.token, nil
 	}
-	token, err := tokenFromGH(baseURL)
+	if cfg.provider == circleCIProvider {
+		return "", errors.New("no token. Set CIRCLECI_TOKEN/CIRCLE_TOKEN or pass --token")
+	}
+	token, err := tokenFromGH(cfg.baseURL)
 	if err == nil && token != "" {
 		return token, nil
 	}
@@ -985,6 +1257,294 @@ func (c *githubClient) sleepUntil(resetEpoch int64, reason string) {
 	c.pauseRequests(wait, reason)
 }
 
+type circleCIClient struct {
+	baseURL          string
+	token            string
+	maxRetries       int
+	timeout          time.Duration
+	requestDelay     time.Duration
+	apiSlots         chan struct{}
+	throttleMu       sync.Mutex
+	lastRequestStart time.Time
+	statsMu          sync.Mutex
+	stats            requestStats
+	verbose          bool
+	debug            bool
+	logWriter        io.Writer
+	httpClient       *http.Client
+	sleep            func(time.Duration)
+	now              func() time.Time
+}
+
+func newCircleCIClient(baseURL, token string, maxRetries int, verbose bool) *circleCIClient {
+	return &circleCIClient{
+		baseURL:    strings.TrimRight(baseURL, "/"),
+		token:      token,
+		maxRetries: maxRetries,
+		timeout:    30 * time.Second,
+		apiSlots:   make(chan struct{}, 1),
+		verbose:    verbose,
+		logWriter:  os.Stderr,
+		httpClient: &http.Client{Timeout: 30 * time.Second},
+		sleep:      time.Sleep,
+		now:        time.Now,
+	}
+}
+
+func (c *circleCIClient) setAPIWorkers(workers int) {
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > 32 {
+		workers = 32
+	}
+	c.apiSlots = make(chan struct{}, workers)
+}
+
+func (c *circleCIClient) statsSnapshot() requestStats {
+	c.statsMu.Lock()
+	defer c.statsMu.Unlock()
+	out := c.stats
+	out.RateLimitSleepSeconds = math.Round(out.RateLimitSleepSeconds*1000) / 1000
+	return out
+}
+
+func (c *circleCIClient) recordRequest() {
+	c.statsMu.Lock()
+	c.stats.Requests++
+	c.statsMu.Unlock()
+}
+
+func (c *circleCIClient) recordRetry() {
+	c.statsMu.Lock()
+	c.stats.Retries++
+	c.statsMu.Unlock()
+}
+
+func (c *circleCIClient) recordRateLimitSleep(delay time.Duration) {
+	c.statsMu.Lock()
+	c.stats.RateLimitSleeps++
+	c.stats.RateLimitSleepSeconds += delay.Seconds()
+	c.statsMu.Unlock()
+}
+
+func (c *circleCIClient) acquireAPISlot() func() {
+	if c.apiSlots == nil {
+		return func() {}
+	}
+	c.apiSlots <- struct{}{}
+	return func() {
+		<-c.apiSlots
+	}
+}
+
+func (c *circleCIClient) waitForRequestStart() {
+	c.throttleMu.Lock()
+	defer c.throttleMu.Unlock()
+	if c.requestDelay > 0 && !c.lastRequestStart.IsZero() {
+		wait := c.lastRequestStart.Add(c.requestDelay).Sub(c.currentTime())
+		if wait > 0 {
+			c.sleep(wait)
+		}
+	}
+	c.lastRequestStart = c.currentTime()
+}
+
+func (c *circleCIClient) pauseRequests(delay time.Duration, reason string) {
+	if delay < time.Second {
+		delay = time.Second
+	}
+	c.throttleMu.Lock()
+	defer c.throttleMu.Unlock()
+	c.recordRateLimitSleep(delay)
+	c.logf("%s: pausing CircleCI API requests for %.0fs", reason, delay.Seconds())
+	c.sleep(delay)
+	c.lastRequestStart = c.currentTime()
+}
+
+func (c *circleCIClient) currentTime() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+func (c *circleCIClient) logf(format string, args ...interface{}) {
+	if c.verbose || c.debug {
+		fmt.Fprintf(c.logOutput(), "[gh-concurrency] "+format+"\n", args...)
+	}
+}
+
+func (c *circleCIClient) debugf(format string, args ...interface{}) {
+	if c.debug {
+		fmt.Fprintf(c.logOutput(), "[gh-concurrency debug] "+format+"\n", args...)
+	}
+}
+
+func (c *circleCIClient) logOutput() io.Writer {
+	if c.logWriter != nil {
+		return c.logWriter
+	}
+	return io.Discard
+}
+
+func (c *circleCIClient) getJSON(path string, params url.Values, into any) error {
+	rawURL := c.baseURL + path
+	if len(params) > 0 {
+		rawURL += "?" + params.Encode()
+	}
+	body, err := c.request(rawURL)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(body, into)
+}
+
+func paginateCircleCIItems[T any](client *circleCIClient, path string, params url.Values, handle func(T) error) error {
+	pageToken := ""
+	page := 1
+	for {
+		currentParams := cloneValues(params)
+		if pageToken != "" {
+			currentParams.Set("page-token", pageToken)
+		}
+		var resp circleCIItemPage[T]
+		if err := client.getJSON(path, currentParams, &resp); err != nil {
+			return err
+		}
+		client.debugf("page %d %s returned %d CircleCI items", page, circleCIPathForLog(path, currentParams), len(resp.Items))
+		for _, item := range resp.Items {
+			if err := handle(item); err != nil {
+				return err
+			}
+		}
+		if resp.NextPageToken == "" {
+			break
+		}
+		pageToken = resp.NextPageToken
+		page++
+	}
+	return nil
+}
+
+func (c *circleCIClient) request(rawURL string) ([]byte, error) {
+	var lastErr error
+	for attempt := 0; attempt < c.maxRetries; attempt++ {
+		if attempt > 0 {
+			c.recordRetry()
+		}
+		req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer "+c.token)
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("User-Agent", "gh-concurrency/"+version)
+
+		c.debugf("GET %s (attempt %d/%d)", requestURLForLog(rawURL), attempt+1, c.maxRetries)
+		release := c.acquireAPISlot()
+		c.waitForRequestStart()
+		c.recordRequest()
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			release()
+			lastErr = err
+			c.logf("CircleCI network error: %v; retrying", err)
+			if attempt == c.maxRetries-1 {
+				break
+			}
+			c.backoff(attempt)
+			continue
+		}
+		c.debugResponse(rawURL, resp)
+
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		release()
+		if readErr != nil {
+			lastErr = readErr
+			if attempt == c.maxRetries-1 {
+				break
+			}
+			c.backoff(attempt)
+			continue
+		}
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return body, nil
+		}
+
+		err = c.httpError(resp, body)
+		switch {
+		case resp.StatusCode == http.StatusNotFound:
+			return nil, notFoundError{URL: rawURL}
+		case resp.StatusCode == http.StatusUnauthorized:
+			return nil, authError{}
+		case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden:
+			if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
+				delay, parseErr := strconv.Atoi(retryAfter)
+				if parseErr == nil && attempt < c.maxRetries-1 {
+					c.logf("%d: honoring CircleCI Retry-After=%ds", resp.StatusCode, delay)
+					c.pauseRequests(time.Duration(delay+1)*time.Second, "CircleCI Retry-After")
+					continue
+				}
+			}
+			if attempt < c.maxRetries-1 && resp.StatusCode == http.StatusTooManyRequests {
+				c.backoff(attempt)
+				continue
+			}
+			return nil, err
+		case resp.StatusCode >= 500:
+			lastErr = err
+			if attempt == c.maxRetries-1 {
+				break
+			}
+			c.backoff(attempt)
+			continue
+		default:
+			return nil, err
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("unknown request failure")
+	}
+	return nil, fmt.Errorf("exhausted %d retries for %s: %w", c.maxRetries, rawURL, lastErr)
+}
+
+func (c *circleCIClient) debugResponse(rawURL string, resp *http.Response) {
+	if !c.debug {
+		return
+	}
+	var details []string
+	if retryAfter := resp.Header.Get("Retry-After"); retryAfter != "" {
+		details = append(details, "retry-after="+retryAfter+"s")
+	}
+	suffix := ""
+	if len(details) > 0 {
+		suffix = " (" + strings.Join(details, ", ") + ")"
+	}
+	c.debugf("%s -> %s%s", requestURLForLog(rawURL), resp.Status, suffix)
+}
+
+func (c *circleCIClient) httpError(resp *http.Response, body []byte) error {
+	msg := strings.TrimSpace(string(bytes.TrimSpace(body)))
+	if len(msg) > 500 {
+		msg = msg[:500] + "..."
+	}
+	if msg == "" {
+		msg = resp.Status
+	}
+	return fmt.Errorf("CircleCI API %s: %s", resp.Status, msg)
+}
+
+func (c *circleCIClient) backoff(attempt int) {
+	base := time.Duration(1<<uint(min(attempt, 6))) * time.Second
+	jitter := time.Duration(rand.Intn(1000)) * time.Millisecond
+	delay := base + jitter
+	c.logf("CircleCI backing off %.1fs (attempt %d)", delay.Seconds(), attempt+1)
+	c.sleep(delay)
+}
+
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -1000,23 +1560,36 @@ func max(a, b int) int {
 }
 
 type progressReporter struct {
-	mu        sync.Mutex
-	out       io.Writer
-	enabled   bool
-	total     int
-	started   int
-	done      int
-	totalJobs int
-	startedAt time.Time
+	mu             sync.Mutex
+	out            io.Writer
+	enabled        bool
+	total          int
+	started        int
+	done           int
+	totalJobs      int
+	startedAt      time.Time
+	targetPlural   string
+	targetSingular string
 }
 
 func newProgressReporter(out io.Writer, enabled bool, total int) *progressReporter {
 	return &progressReporter{
-		out:       out,
-		enabled:   enabled && out != nil,
-		total:     total,
-		startedAt: time.Now(),
+		out:            out,
+		enabled:        enabled && out != nil,
+		total:          total,
+		startedAt:      time.Now(),
+		targetPlural:   "repositories",
+		targetSingular: "repo",
 	}
+}
+
+func newProgressReporterForProvider(out io.Writer, enabled bool, total int, provider string) *progressReporter {
+	progress := newProgressReporter(out, enabled, total)
+	if provider == circleCIProvider {
+		progress.targetPlural = "projects"
+		progress.targetSingular = "project"
+	}
+	return progress
 }
 
 func (p *progressReporter) Begin() {
@@ -1025,7 +1598,7 @@ func (p *progressReporter) Begin() {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	fmt.Fprintf(p.out, "[gh-concurrency] repositories queued: %d\n", p.total)
+	fmt.Fprintf(p.out, "[gh-concurrency] %s queued: %d\n", p.targetPlural, p.total)
 	fmt.Fprintf(p.out, "[gh-concurrency] progress: %s 0/%d\n", progressBar(0, p.total, 24), p.total)
 }
 
@@ -1036,7 +1609,7 @@ func (p *progressReporter) Start(repo string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.started++
-	fmt.Fprintf(p.out, "[gh-concurrency] examining repo %d/%d: %s\n", p.started, p.total, repo)
+	fmt.Fprintf(p.out, "[gh-concurrency] examining %s %d/%d: %s\n", p.targetSingular, p.started, p.total, repo)
 }
 
 func (p *progressReporter) Done(repo string, jobs int) {
@@ -1069,8 +1642,8 @@ func (p *progressReporter) Complete() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	elapsed := time.Since(p.startedAt).Round(time.Second)
-	fmt.Fprintf(p.out, "[gh-concurrency] complete: %d/%d repositories, %d jobs, %s elapsed\n",
-		p.done, p.total, p.totalJobs, elapsed)
+	fmt.Fprintf(p.out, "[gh-concurrency] complete: %d/%d %s, %d jobs, %s elapsed\n",
+		p.done, p.total, p.targetPlural, p.totalJobs, elapsed)
 }
 
 func progressBar(done, total, width int) string {
@@ -1192,6 +1765,7 @@ type workflowRun struct {
 	RunStartedAt string `json:"run_started_at"`
 	UpdatedAt    string `json:"updated_at"`
 	Repo         string `json:"-"`
+	Provider     string `json:"-"`
 }
 
 type workflowJob struct {
@@ -1207,6 +1781,7 @@ type workflowJob struct {
 }
 
 type record struct {
+	Provider        string
 	Repo            string
 	WorkflowName    string
 	JobName         string
@@ -1219,6 +1794,9 @@ type record struct {
 	Labels          []string
 	RunnerName      string
 	RunnerGroupName string
+	ResourceClass   string
+	Executor        string
+	Parallelism     int
 }
 
 type collectOptions struct {
@@ -1230,11 +1808,14 @@ type collectOptions struct {
 	Event               string
 	ExcludePullRequests bool
 	APIWorkers          int
+	CircleCIJobDetails  bool
+	CircleCIMaxPages    int
 }
 
 type repoScanResult struct {
 	Repo         string
 	Records      []record
+	Pipelines    int
 	WorkflowRuns int
 	WorkflowJobs int
 	JobsUsed     int
@@ -1411,6 +1992,7 @@ func normalizeJob(job workflowJob, repo string) (*record, error) {
 	}
 
 	return &record{
+		Provider:        githubProvider,
 		Repo:            repo,
 		WorkflowName:    strings.TrimSpace(job.WorkflowName),
 		JobName:         strings.TrimSpace(job.Name),
@@ -1553,6 +2135,7 @@ func billableMinutes(records []record) map[string]billableSlot {
 
 type runnerPool struct {
 	Name                  string         `json:"name"`
+	Provider              string         `json:"provider,omitempty"`
 	Jobs                  int            `json:"jobs"`
 	BusyHours             float64        `json:"busy_hours"`
 	PeakConcurrency       int            `json:"peak_concurrency"`
@@ -1561,6 +2144,8 @@ type runnerPool struct {
 	SelfHosted            bool           `json:"self_hosted"`
 	OS                    string         `json:"os,omitempty"`
 	RunnerGroupName       string         `json:"runner_group_name,omitempty"`
+	ResourceClass         string         `json:"resource_class,omitempty"`
+	Executor              string         `json:"executor,omitempty"`
 }
 
 type usageSummary struct {
@@ -1572,11 +2157,14 @@ type usageSummary struct {
 }
 
 type runnerPoolKey struct {
+	provider        string
 	name            string
 	gitHubHosted    bool
 	selfHosted      bool
 	osName          string
 	runnerGroupName string
+	resourceClass   string
+	executor        string
 }
 
 func runnerPools(records []record) []runnerPool {
@@ -1601,6 +2189,7 @@ func runnerPools(records []record) []runnerPool {
 
 		pools = append(pools, runnerPool{
 			Name:                  key.name,
+			Provider:              key.provider,
 			Jobs:                  len(poolRecords),
 			BusyHours:             math.Round((busySeconds/3600.0)*100) / 100,
 			PeakConcurrency:       peak,
@@ -1609,6 +2198,8 @@ func runnerPools(records []record) []runnerPool {
 			SelfHosted:            key.selfHosted,
 			OS:                    key.osName,
 			RunnerGroupName:       key.runnerGroupName,
+			ResourceClass:         key.resourceClass,
+			Executor:              key.executor,
 		})
 	}
 
@@ -1695,12 +2286,31 @@ func jobSummaryName(rec record) string {
 }
 
 func classifyRunnerPool(rec record) runnerPoolKey {
+	provider := rec.Provider
+	if provider == "" {
+		provider = githubProvider
+	}
 	osName := rec.OS
 	if osName == "" {
 		osName = "unknown"
 	}
+	if provider == circleCIProvider {
+		resourceClass := strings.TrimSpace(rec.ResourceClass)
+		if resourceClass == "" {
+			resourceClass = "unknown"
+		}
+		executor := strings.TrimSpace(rec.Executor)
+		return runnerPoolKey{
+			provider:      circleCIProvider,
+			name:          "CircleCI/" + resourceClass,
+			osName:        osName,
+			resourceClass: resourceClass,
+			executor:      executor,
+		}
+	}
 	if !rec.SelfHosted {
 		return runnerPoolKey{
+			provider:     githubProvider,
 			name:         "GitHub-hosted/" + osName,
 			gitHubHosted: true,
 			osName:       osName,
@@ -1715,6 +2325,7 @@ func classifyRunnerPool(rec record) runnerPoolKey {
 		groupName = "unknown"
 	}
 	return runnerPoolKey{
+		provider:        githubProvider,
 		name:            "self-hosted/" + groupName,
 		selfHosted:      true,
 		runnerGroupName: groupName,
@@ -1770,6 +2381,7 @@ type scanSummary struct {
 	RepositoriesScanned   int                 `json:"repositories_scanned"`
 	RepositoriesSkipped   int                 `json:"repositories_skipped"`
 	SkippedRepositories   []skippedRepository `json:"skipped_repositories,omitempty"`
+	Pipelines             int                 `json:"pipelines,omitempty"`
 	WorkflowRuns          int                 `json:"workflow_runs"`
 	WorkflowJobs          int                 `json:"workflow_jobs"`
 	JobsUsed              int                 `json:"jobs_used"`
@@ -1846,6 +2458,7 @@ func collectRepositories(client *githubClient, repos []string, opts collectOptio
 		mu.Lock()
 		defer mu.Unlock()
 		summary.RepositoriesScanned++
+		summary.Pipelines += result.Pipelines
 		summary.WorkflowRuns += result.WorkflowRuns
 		summary.WorkflowJobs += result.WorkflowJobs
 		summary.JobsUsed += result.JobsUsed
@@ -1917,6 +2530,570 @@ func collectRepositories(client *githubClient, repos []string, opts collectOptio
 	return records, summary, nil
 }
 
+type circleCIPipeline struct {
+	ID          string `json:"id"`
+	ProjectSlug string `json:"project_slug"`
+	Number      int    `json:"number"`
+	State       string `json:"state"`
+	CreatedAt   string `json:"created_at"`
+	UpdatedAt   string `json:"updated_at"`
+	VCS         struct {
+		Branch string `json:"branch"`
+		Tag    string `json:"tag"`
+	} `json:"vcs"`
+	Trigger struct {
+		Type string `json:"type"`
+	} `json:"trigger"`
+}
+
+type circleCIWorkflow struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Status    string `json:"status"`
+	CreatedAt string `json:"created_at"`
+	StoppedAt string `json:"stopped_at"`
+}
+
+type circleCIJob struct {
+	ID           string `json:"id"`
+	JobNumber    int    `json:"job_number"`
+	Number       int    `json:"number"`
+	StartedAt    string `json:"started_at"`
+	StoppedAt    string `json:"stopped_at"`
+	QueuedAt     string `json:"queued_at"`
+	CreatedAt    string `json:"created_at"`
+	Name         string `json:"name"`
+	Status       string `json:"status"`
+	Type         string `json:"type"`
+	ProjectSlug  string `json:"project_slug"`
+	Parallelism  int    `json:"parallelism"`
+	ParallelRuns []struct {
+		Index  int    `json:"index"`
+		Status string `json:"status"`
+	} `json:"parallel_runs"`
+	Executor struct {
+		ResourceClass string `json:"resource_class"`
+		Type          string `json:"type"`
+	} `json:"executor"`
+	LatestWorkflow struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	} `json:"latest_workflow"`
+}
+
+type circleCIItemPage[T any] struct {
+	Items         []T    `json:"items"`
+	NextPageToken string `json:"next_page_token"`
+}
+
+func collectCircleCIProjects(client *circleCIClient, projects []string, opts collectOptions, progress *progressReporter, stderr io.Writer) ([]record, scanSummary, error) {
+	summary := scanSummary{
+		RepositoriesQueued: len(projects),
+		Conclusions:        map[string]int{},
+	}
+	workers := boundedWorkerCount(opts.APIWorkers, len(projects))
+	projectCh := make(chan string)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var records []record
+	var fatalErr error
+
+	setFatal := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if fatalErr == nil {
+			fatalErr = err
+		}
+	}
+	hasFatal := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return fatalErr != nil
+	}
+	addSkipped := func(project, reason string) {
+		mu.Lock()
+		defer mu.Unlock()
+		summary.SkippedRepositories = append(summary.SkippedRepositories, skippedRepository{Repo: project, Reason: reason})
+	}
+	addResult := func(result repoScanResult) {
+		mu.Lock()
+		defer mu.Unlock()
+		summary.RepositoriesScanned++
+		summary.Pipelines += result.Pipelines
+		summary.WorkflowRuns += result.WorkflowRuns
+		summary.WorkflowJobs += result.WorkflowJobs
+		summary.JobsUsed += result.JobsUsed
+		for _, rec := range result.Records {
+			conclusion := rec.Conclusion
+			if conclusion == "" {
+				conclusion = "unknown"
+			}
+			summary.Conclusions[conclusion]++
+		}
+		records = append(records, result.Records...)
+	}
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for project := range projectCh {
+				if hasFatal() {
+					continue
+				}
+				progress.Start(project)
+				result, err := collectCircleCIProjectJobs(client, project, opts)
+				if err != nil {
+					var nf notFoundError
+					var ae authError
+					switch {
+					case errors.As(err, &nf):
+						fmt.Fprintf(stderr, "warning: %s not found or no CircleCI project access; skipping.\n", project)
+						addSkipped(project, "not found or no CircleCI project access")
+						progress.Skip(project)
+						continue
+					case errors.As(err, &ae):
+						setFatal(authError{})
+						continue
+					default:
+						setFatal(err)
+						continue
+					}
+				}
+				addResult(result)
+				progress.Done(project, len(result.Records))
+			}
+		}()
+	}
+
+	for _, project := range projects {
+		if hasFatal() {
+			break
+		}
+		projectCh <- project
+	}
+	close(projectCh)
+	wg.Wait()
+
+	sortSkippedRepositories(summary.SkippedRepositories)
+	summary.RepositoriesSkipped = len(summary.SkippedRepositories)
+	if len(summary.Conclusions) == 0 {
+		summary.Conclusions = nil
+	}
+	sortRecords(records)
+
+	mu.Lock()
+	err := fatalErr
+	mu.Unlock()
+	if err != nil {
+		return nil, summary, err
+	}
+	return records, summary, nil
+}
+
+func collectCircleCIProjectJobs(client *circleCIClient, project string, opts collectOptions) (repoScanResult, error) {
+	result := repoScanResult{Repo: project}
+	client.logf("%s: listing CircleCI pipelines", project)
+	pipelines, err := listCircleCIPipelines(client, project, opts)
+	if err != nil {
+		return result, err
+	}
+	result.Pipelines = len(pipelines)
+	if len(pipelines) == 0 {
+		client.logf("%s: 0 pipelines, 0 workflows, 0 workflow jobs, 0 jobs used", project)
+		return result, nil
+	}
+
+	var workflows []circleCIWorkflow
+	for _, pipeline := range pipelines {
+		pipelineWorkflows, err := listCircleCIWorkflows(client, pipeline.ID)
+		if err != nil {
+			return result, err
+		}
+		workflows = append(workflows, pipelineWorkflows...)
+	}
+	result.WorkflowRuns = len(workflows)
+	if len(workflows) == 0 {
+		client.logf("%s: %d pipelines, 0 workflows, 0 workflow jobs, 0 jobs used", project, result.Pipelines)
+		return result, nil
+	}
+
+	workers := boundedWorkerCount(opts.APIWorkers, len(workflows))
+	workflowCh := make(chan circleCIWorkflow)
+	resultCh := make(chan repoScanResult, workers)
+	errCh := make(chan error, workers)
+	var wg sync.WaitGroup
+
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for workflow := range workflowCh {
+				workflowResult, err := collectCircleCIWorkflowJobs(client, project, workflow, opts)
+				if err != nil {
+					errCh <- err
+					continue
+				}
+				resultCh <- workflowResult
+			}
+		}()
+	}
+
+	go func() {
+		for _, workflow := range workflows {
+			workflowCh <- workflow
+		}
+		close(workflowCh)
+		wg.Wait()
+		close(resultCh)
+		close(errCh)
+	}()
+
+	var firstErr error
+	for resultCh != nil || errCh != nil {
+		select {
+		case err, ok := <-errCh:
+			if !ok {
+				errCh = nil
+				continue
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
+		case workflowResult, ok := <-resultCh:
+			if !ok {
+				resultCh = nil
+				continue
+			}
+			result.WorkflowJobs += workflowResult.WorkflowJobs
+			result.JobsUsed += workflowResult.JobsUsed
+			result.Records = append(result.Records, workflowResult.Records...)
+		}
+	}
+	if firstErr != nil {
+		return result, firstErr
+	}
+
+	sortRecords(result.Records)
+	client.logf("%s: %d pipelines, %d workflows, %d workflow jobs, %d jobs used", project, result.Pipelines, result.WorkflowRuns, result.WorkflowJobs, result.JobsUsed)
+	return result, nil
+}
+
+func listCircleCIPipelines(client *circleCIClient, project string, opts collectOptions) ([]circleCIPipeline, error) {
+	start, end, hasEnd, err := dateWindow(opts.Since, opts.Until)
+	if err != nil {
+		return nil, err
+	}
+	params := url.Values{}
+	if opts.Branch != "" {
+		params.Set("branch", opts.Branch)
+	}
+	path := circleCIProjectPath(project) + "/pipeline"
+	pageToken := ""
+	page := 0
+	var pipelines []circleCIPipeline
+	for {
+		page++
+		currentParams := cloneValues(params)
+		if pageToken != "" {
+			currentParams.Set("page-token", pageToken)
+		}
+		var resp circleCIItemPage[circleCIPipeline]
+		if err := client.getJSON(path, currentParams, &resp); err != nil {
+			return nil, err
+		}
+		client.debugf("page %d %s returned %d CircleCI pipelines", page, circleCIPathForLog(path, currentParams), len(resp.Items))
+
+		allBeforeSince := len(resp.Items) > 0
+		for _, pipeline := range resp.Items {
+			if pipeline.ProjectSlug == "" {
+				pipeline.ProjectSlug = project
+			}
+			created, ok, err := parseOptionalTime(pipeline.CreatedAt, "CircleCI pipeline created_at")
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				allBeforeSince = false
+				pipelines = append(pipelines, pipeline)
+				continue
+			}
+			if !created.Before(start) {
+				allBeforeSince = false
+			}
+			if created.Before(start) {
+				continue
+			}
+			if hasEnd && !created.Before(end) {
+				continue
+			}
+			pipelines = append(pipelines, pipeline)
+		}
+
+		if resp.NextPageToken == "" {
+			break
+		}
+		if opts.CircleCIMaxPages > 0 && page >= opts.CircleCIMaxPages {
+			break
+		}
+		if allBeforeSince {
+			break
+		}
+		pageToken = resp.NextPageToken
+	}
+	return pipelines, nil
+}
+
+func listCircleCIWorkflows(client *circleCIClient, pipelineID string) ([]circleCIWorkflow, error) {
+	if strings.TrimSpace(pipelineID) == "" {
+		return nil, errors.New("CircleCI pipeline did not include an id")
+	}
+	path := "/pipeline/" + url.PathEscape(pipelineID) + "/workflow"
+	var workflows []circleCIWorkflow
+	err := paginateCircleCIItems(client, path, url.Values{}, func(workflow circleCIWorkflow) error {
+		workflows = append(workflows, workflow)
+		return nil
+	})
+	return workflows, err
+}
+
+func collectCircleCIWorkflowJobs(client *circleCIClient, project string, workflow circleCIWorkflow, opts collectOptions) (repoScanResult, error) {
+	result := repoScanResult{Repo: project}
+	if strings.TrimSpace(workflow.ID) == "" {
+		return result, errors.New("CircleCI workflow did not include an id")
+	}
+	path := "/workflow/" + url.PathEscape(workflow.ID) + "/job"
+	err := paginateCircleCIItems(client, path, url.Values{}, func(job circleCIJob) error {
+		result.WorkflowJobs++
+		if job.ProjectSlug == "" {
+			job.ProjectSlug = project
+		}
+		if opts.CircleCIJobDetails {
+			number := circleCIJobNumber(job)
+			if number > 0 {
+				details, err := getCircleCIJobDetails(client, job.ProjectSlug, number)
+				if err != nil {
+					var nf notFoundError
+					if !errors.As(err, &nf) {
+						return err
+					}
+				} else {
+					job = mergeCircleCIJob(job, details)
+				}
+			}
+		}
+		records, err := normalizeCircleCIJob(job, project, workflow.Name)
+		if err != nil {
+			return err
+		}
+		result.JobsUsed += len(records)
+		result.Records = append(result.Records, records...)
+		return nil
+	})
+	return result, err
+}
+
+func getCircleCIJobDetails(client *circleCIClient, project string, jobNumber int) (circleCIJob, error) {
+	var job circleCIJob
+	if strings.TrimSpace(project) == "" {
+		return job, errors.New("CircleCI job did not include a project slug")
+	}
+	path := circleCIProjectPath(project) + "/job/" + strconv.Itoa(jobNumber)
+	if err := client.getJSON(path, url.Values{}, &job); err != nil {
+		return job, err
+	}
+	if job.ProjectSlug == "" {
+		job.ProjectSlug = project
+	}
+	return job, nil
+}
+
+func mergeCircleCIJob(base, details circleCIJob) circleCIJob {
+	if details.ID == "" {
+		details.ID = base.ID
+	}
+	if details.JobNumber == 0 {
+		details.JobNumber = base.JobNumber
+	}
+	if details.Number == 0 {
+		details.Number = base.Number
+	}
+	if details.Name == "" {
+		details.Name = base.Name
+	}
+	if details.Status == "" {
+		details.Status = base.Status
+	}
+	if details.Type == "" {
+		details.Type = base.Type
+	}
+	if details.ProjectSlug == "" {
+		details.ProjectSlug = base.ProjectSlug
+	}
+	if details.StartedAt == "" {
+		details.StartedAt = base.StartedAt
+	}
+	if details.StoppedAt == "" {
+		details.StoppedAt = base.StoppedAt
+	}
+	if details.QueuedAt == "" {
+		details.QueuedAt = base.QueuedAt
+	}
+	if details.CreatedAt == "" {
+		details.CreatedAt = base.CreatedAt
+	}
+	if details.Parallelism == 0 {
+		details.Parallelism = base.Parallelism
+	}
+	if len(details.ParallelRuns) == 0 {
+		details.ParallelRuns = base.ParallelRuns
+	}
+	if details.Executor.ResourceClass == "" {
+		details.Executor.ResourceClass = base.Executor.ResourceClass
+	}
+	if details.Executor.Type == "" {
+		details.Executor.Type = base.Executor.Type
+	}
+	if details.LatestWorkflow.Name == "" {
+		details.LatestWorkflow.Name = base.LatestWorkflow.Name
+	}
+	return details
+}
+
+func circleCIJobNumber(job circleCIJob) int {
+	if job.JobNumber > 0 {
+		return job.JobNumber
+	}
+	return job.Number
+}
+
+func normalizeCircleCIJob(job circleCIJob, project, workflowName string) ([]record, error) {
+	if job.StartedAt == "" || job.StoppedAt == "" {
+		return nil, nil
+	}
+	start, err := time.Parse(time.RFC3339, job.StartedAt)
+	if err != nil {
+		return nil, fmt.Errorf("parse CircleCI started_at %q: %w", job.StartedAt, err)
+	}
+	end, err := time.Parse(time.RFC3339, job.StoppedAt)
+	if err != nil {
+		return nil, fmt.Errorf("parse CircleCI stopped_at %q: %w", job.StoppedAt, err)
+	}
+	if !end.After(start) {
+		return nil, nil
+	}
+
+	var queueSeconds *float64
+	for _, value := range []string{job.QueuedAt, job.CreatedAt} {
+		queued, ok, err := parseOptionalTime(value, "CircleCI queued_at")
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			q := start.Sub(queued).Seconds()
+			if q < 0 {
+				q = 0
+			}
+			queueSeconds = &q
+			break
+		}
+	}
+
+	parallelism := job.Parallelism
+	if parallelism < 1 && len(job.ParallelRuns) > 0 {
+		parallelism = len(job.ParallelRuns)
+	}
+	if parallelism < 1 {
+		parallelism = 1
+	}
+	resourceClass := strings.TrimSpace(job.Executor.ResourceClass)
+	if resourceClass == "" {
+		resourceClass = "unknown"
+	}
+	executor := strings.TrimSpace(job.Executor.Type)
+	workflow := firstNonEmpty(workflowName, job.LatestWorkflow.Name, "unknown workflow")
+	jobName := firstNonEmpty(job.Name, "unknown job")
+	status := strings.TrimSpace(job.Status)
+	osName := inferCircleCIOS(resourceClass, executor)
+
+	records := make([]record, 0, parallelism)
+	for i := 0; i < parallelism; i++ {
+		records = append(records, record{
+			Provider:        circleCIProvider,
+			Repo:            project,
+			WorkflowName:    workflow,
+			JobName:         jobName,
+			Conclusion:      status,
+			Start:           start,
+			End:             end,
+			QueueSeconds:    queueSeconds,
+			OS:              osName,
+			SelfHosted:      false,
+			RunnerGroupName: resourceClass,
+			ResourceClass:   resourceClass,
+			Executor:        executor,
+			Parallelism:     parallelism,
+		})
+	}
+	return records, nil
+}
+
+func inferCircleCIOS(resourceClass, executor string) string {
+	joined := strings.ToLower(resourceClass + " " + executor)
+	switch {
+	case strings.Contains(joined, "windows"):
+		return "windows"
+	case strings.Contains(joined, "macos"), strings.Contains(joined, "mac-"):
+		return "macos"
+	case strings.Contains(joined, "arm"):
+		return "linux"
+	default:
+		return "linux"
+	}
+}
+
+func dateWindow(since, until string) (time.Time, time.Time, bool, error) {
+	start, err := time.Parse("2006-01-02", since)
+	if err != nil {
+		return time.Time{}, time.Time{}, false, err
+	}
+	if until == "" {
+		return start, time.Time{}, false, nil
+	}
+	endDay, err := time.Parse("2006-01-02", until)
+	if err != nil {
+		return time.Time{}, time.Time{}, false, err
+	}
+	return start, endDay.Add(24 * time.Hour), true, nil
+}
+
+func parseOptionalTime(value, label string) (time.Time, bool, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, false, nil
+	}
+	t, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("parse %s %q: %w", label, value, err)
+	}
+	return t, true, nil
+}
+
+func circleCIProjectPath(project string) string {
+	parts := strings.Split(project, "/")
+	for i, part := range parts {
+		parts[i] = url.PathEscape(part)
+	}
+	return "/project/" + strings.Join(parts, "/")
+}
+
+func circleCIPathForLog(path string, params url.Values) string {
+	if len(params) == 0 {
+		return path
+	}
+	return path + "?" + params.Encode()
+}
+
 type workflowRunPage struct {
 	TotalCount   int           `json:"total_count"`
 	WorkflowRuns []workflowRun `json:"workflow_runs"`
@@ -1930,6 +3107,7 @@ type sampledRun struct {
 type jobShape struct {
 	Offset          time.Duration
 	Duration        time.Duration
+	Provider        string
 	WorkflowName    string
 	JobName         string
 	Conclusion      string
@@ -1938,6 +3116,9 @@ type jobShape struct {
 	Labels          []string
 	RunnerName      string
 	RunnerGroupName string
+	ResourceClass   string
+	Executor        string
+	Parallelism     int
 }
 
 type runShape struct {
@@ -2169,6 +3350,7 @@ func listWorkflowRunsForEstimate(client *githubClient, repo string, opts collect
 		}
 		for _, run := range page.WorkflowRuns {
 			run.Repo = repo
+			run.Provider = githubProvider
 			runs = append(runs, run)
 		}
 		nextURL = nextLink(link)
@@ -2356,6 +3538,7 @@ func buildRunShape(run workflowRun, records []record) runShape {
 		shape.Jobs = append(shape.Jobs, jobShape{
 			Offset:          offset,
 			Duration:        rec.End.Sub(rec.Start),
+			Provider:        rec.Provider,
 			WorkflowName:    rec.WorkflowName,
 			JobName:         rec.JobName,
 			Conclusion:      rec.Conclusion,
@@ -2364,6 +3547,9 @@ func buildRunShape(run workflowRun, records []record) runShape {
 			Labels:          append([]string{}, rec.Labels...),
 			RunnerName:      rec.RunnerName,
 			RunnerGroupName: rec.RunnerGroupName,
+			ResourceClass:   rec.ResourceClass,
+			Executor:        rec.Executor,
+			Parallelism:     rec.Parallelism,
 		})
 	}
 	return shape
@@ -2388,6 +3574,7 @@ func applyRunShape(run workflowRun, anchor time.Time, shape runShape) []record {
 			continue
 		}
 		records = append(records, record{
+			Provider:        firstNonEmpty(run.Provider, job.Provider, githubProvider),
 			Repo:            run.Repo,
 			WorkflowName:    firstNonEmpty(run.Name, job.WorkflowName),
 			JobName:         job.JobName,
@@ -2399,6 +3586,9 @@ func applyRunShape(run workflowRun, anchor time.Time, shape runShape) []record {
 			Labels:          append([]string{}, job.Labels...),
 			RunnerName:      job.RunnerName,
 			RunnerGroupName: job.RunnerGroupName,
+			ResourceClass:   job.ResourceClass,
+			Executor:        job.Executor,
+			Parallelism:     job.Parallelism,
 		})
 	}
 	return records
@@ -2602,7 +3792,7 @@ func computeQueueStats(records []record) *queueStats {
 	}
 }
 
-func detectWarnings(peak int, pct map[int]int, qstats *queueStats) []string {
+func detectWarnings(provider string, peak int, pct map[int]int, qstats *queueStats) []string {
 	var warnings []string
 	if qstats != nil && qstats.P95S > 60 {
 		warnings = append(warnings, fmt.Sprintf(
@@ -2612,19 +3802,29 @@ func detectWarnings(peak int, pct map[int]int, qstats *queueStats) []string {
 	}
 	roundPeaks := map[int]bool{5: true, 10: true, 20: true, 40: true, 60: true, 180: true, 300: true}
 	if roundPeaks[peak] && pct[95] == peak {
+		limitName := "a GitHub concurrency limit"
+		if provider == circleCIProvider {
+			limitName = "a CircleCI concurrency or resource limit"
+		}
 		warnings = append(warnings, fmt.Sprintf(
-			"Peak (%d) sits at a round number and equals p95, which can indicate you were hitting a GitHub concurrency limit. If so, real demand exceeds this figure.",
-			peak,
+			"Peak (%d) sits at a round number and equals p95, which can indicate you were hitting %s. If so, real demand exceeds this figure.",
+			peak, limitName,
 		))
 	}
 	return warnings
 }
 
 type parameters struct {
+	Provider             string   `json:"provider"`
 	Repos                []string `json:"repos"`
 	Orgs                 []string `json:"orgs,omitempty"`
 	RepoFiles            []string `json:"repo_files,omitempty"`
 	OrgFiles             []string `json:"org_files,omitempty"`
+	CircleCIProjects     []string `json:"circleci_projects,omitempty"`
+	CircleCIProjectFiles []string `json:"circleci_project_files,omitempty"`
+	CircleCIVCS          string   `json:"circleci_vcs,omitempty"`
+	CircleCIJobDetails   bool     `json:"circleci_job_details,omitempty"`
+	CircleCIMaxPages     int      `json:"circleci_max_pages,omitempty"`
 	RepoType             string   `json:"repo_type,omitempty"`
 	IncludeArchived      bool     `json:"include_archived"`
 	RepositoryCount      int      `json:"repository_count"`
@@ -2687,6 +3887,17 @@ func buildReport(records []record, cfg config, runtime time.Duration, summary sc
 	summary.RateLimitSleepSeconds = stats.RateLimitSleepSeconds
 	summary.RuntimeSeconds = runtimeS
 	params := buildParameters(cfg)
+	billable := billableMinutes(records)
+	if params.Provider == circleCIProvider {
+		billable = nil
+	}
+	warnings := detectWarnings(params.Provider, peak, pct, qstats)
+	if params.Provider == circleCIProvider && !cfg.circleCIJobDetails {
+		warnings = append(warnings, "CircleCI job details were disabled, so resource classes, queue time, and parallelism may be underreported.")
+	}
+	if params.Provider == circleCIProvider && cfg.circleCIMaxPages > 0 {
+		warnings = append(warnings, fmt.Sprintf("CircleCI pipeline scanning was capped at %d pages per project; older matching pipelines may be undercounted.", cfg.circleCIMaxPages))
+	}
 	return report{
 		Tool:                    "gh-concurrency",
 		Version:                 version,
@@ -2702,21 +3913,30 @@ func buildReport(records []record, cfg config, runtime time.Duration, summary sc
 		TopRepositories:         topUsageSummaries(records, cfg.top, func(rec record) string { return rec.Repo }),
 		TopWorkflows:            topUsageSummaries(records, cfg.top, workflowSummaryName),
 		TopJobs:                 topUsageSummaries(records, cfg.top, jobSummaryName),
-		BillableMinutesEstimate: billableMinutes(records),
+		BillableMinutesEstimate: billable,
 		QueueSeconds:            qstats,
-		Warnings:                detectWarnings(peak, pct, qstats),
+		Warnings:                warnings,
 	}
 }
 
 func buildParameters(cfg config) parameters {
+	provider := cfg.provider
+	if provider == "" {
+		provider = githubProvider
+	}
+	repositoryCount := len(cfg.repos)
+	if provider == circleCIProvider {
+		repositoryCount = len(cfg.circleCIProjects)
+	}
 	params := parameters{
+		Provider:            provider,
 		Repos:               cfg.repos,
 		Orgs:                cfg.orgs,
 		RepoFiles:           cfg.repoFiles,
 		OrgFiles:            cfg.orgFiles,
 		RepoType:            cfg.repoType,
 		IncludeArchived:     cfg.includeArchived,
-		RepositoryCount:     len(cfg.repos),
+		RepositoryCount:     repositoryCount,
 		Since:               cfg.since,
 		Until:               cfg.until,
 		BaseURL:             cfg.baseURL,
@@ -2728,6 +3948,13 @@ func buildParameters(cfg config) parameters {
 		ExcludePullRequests: cfg.excludePullRequests,
 		Top:                 cfg.top,
 		Mode:                modeName(cfg),
+	}
+	if provider == circleCIProvider {
+		params.CircleCIProjects = cfg.circleCIProjects
+		params.CircleCIProjectFiles = cfg.circleCIProjectFiles
+		params.CircleCIVCS = cfg.circleCIVCS
+		params.CircleCIJobDetails = cfg.circleCIJobDetails
+		params.CircleCIMaxPages = cfg.circleCIMaxPages
 	}
 	if cfg.estimate {
 		params.EstimateMaxRequests = cfg.estimateMaxRequests
@@ -2782,25 +4009,38 @@ func displayVersion(value string) string {
 
 func printText(out io.Writer, rep report) {
 	p := rep.Parameters
+	provider := p.Provider
+	if provider == "" {
+		provider = githubProvider
+	}
 	until := p.Until
 	if until == "" {
 		until = "now"
 	}
 	fmt.Fprintf(out, "\ngh-concurrency %s\n", displayVersion(rep.Version))
-	if len(p.Orgs) > 0 {
+	if provider == githubProvider && len(p.Orgs) > 0 {
 		fmt.Fprintf(out, "orgs:   %s\n", strings.Join(p.Orgs, ", "))
 	}
 	if len(p.RepoFiles) > 0 {
 		fmt.Fprintf(out, "repo files: %s\n", strings.Join(p.RepoFiles, ", "))
 	}
-	if len(p.OrgFiles) > 0 {
+	if provider == githubProvider && len(p.OrgFiles) > 0 {
 		fmt.Fprintf(out, "org files:  %s\n", strings.Join(p.OrgFiles, ", "))
 	}
-	if p.IncludeArchived {
+	if provider == circleCIProvider && len(p.CircleCIProjectFiles) > 0 {
+		fmt.Fprintf(out, "project files: %s\n", strings.Join(p.CircleCIProjectFiles, ", "))
+	}
+	if provider == githubProvider && p.IncludeArchived {
 		fmt.Fprintln(out, "archived repos: included")
 	}
-	fmt.Fprintf(out, "repos:  %s\n", summarizeRepos(p.Repos))
-	fmt.Fprintf(out, "repo count: %d\n", p.RepositoryCount)
+	targetLabel := "repos"
+	countLabel := "repo count"
+	if provider == circleCIProvider {
+		targetLabel = "projects"
+		countLabel = "project count"
+	}
+	fmt.Fprintf(out, "%s:  %s\n", targetLabel, summarizeRepos(p.Repos))
+	fmt.Fprintf(out, "%s: %d\n", countLabel, p.RepositoryCount)
 	fmt.Fprintf(out, "window: %s -> %s   api: %s\n", p.Since, until, p.BaseURL)
 	fmt.Fprintf(out, "filters: runs=%s jobs=%s workers=%d", p.RunStatus, p.JobFilter, p.APIWorkers)
 	if p.Branch != "" {
@@ -2825,7 +4065,7 @@ func printText(out io.Writer, rep report) {
 		fmt.Fprintf(out, "%s concurrency:       %d\n", key, rep.PercentileConcurrency[key])
 	}
 
-	printScanSummary(out, rep.Scan)
+	printScanSummaryForProvider(out, rep.Scan, provider)
 
 	if len(rep.RunnerPools) > 0 {
 		fmt.Fprintln(out, "\nRunner pools:")
@@ -2901,7 +4141,7 @@ func printEstimateText(out io.Writer, rep report) {
 			formatEstimateNumber(interval.Lower),
 			formatEstimateNumber(interval.Upper))
 	}
-	printScanSummary(out, rep.Scan)
+	printScanSummaryForProvider(out, rep.Scan, rep.Parameters.Provider)
 	fmt.Fprintln(out, "\nEstimate notes:")
 	fmt.Fprintln(out, "  These are sampled simulation intervals, not billing-grade exact measurements.")
 	for _, warning := range est.Warnings {
@@ -2914,9 +4154,21 @@ func formatEstimateNumber(value float64) string {
 }
 
 func printScanSummary(out io.Writer, summary scanSummary) {
+	printScanSummaryForProvider(out, summary, githubProvider)
+}
+
+func printScanSummaryForProvider(out io.Writer, summary scanSummary, provider string) {
+	targetLabel := "repositories"
+	if provider == circleCIProvider {
+		targetLabel = "projects"
+	}
 	fmt.Fprintln(out, "\nScan summary:")
-	fmt.Fprintf(out, "  repositories: queued %d  scanned %d  skipped %d\n",
+	fmt.Fprintf(out, "  %s: queued %d  scanned %d  skipped %d\n",
+		targetLabel,
 		summary.RepositoriesQueued, summary.RepositoriesScanned, summary.RepositoriesSkipped)
+	if summary.Pipelines > 0 {
+		fmt.Fprintf(out, "  pipelines: %s\n", comma(summary.Pipelines))
+	}
 	fmt.Fprintf(out, "  workflow runs: %s  workflow jobs seen: %s  jobs used: %s\n",
 		comma(summary.WorkflowRuns), comma(summary.WorkflowJobs), comma(summary.JobsUsed))
 	fmt.Fprintf(out, "  API: %s requests  %s retries  %s rate-limit sleeps (%.1fs)\n",
@@ -2929,7 +4181,7 @@ func printScanSummary(out io.Writer, summary scanSummary) {
 		fmt.Fprintf(out, "  conclusions: %s\n", strings.Join(parts, ", "))
 	}
 	if len(summary.SkippedRepositories) > 0 {
-		fmt.Fprintln(out, "  skipped repositories:")
+		fmt.Fprintf(out, "  skipped %s:\n", targetLabel)
 		for _, skipped := range summary.SkippedRepositories {
 			fmt.Fprintf(out, "    %s (%s)\n", skipped.Repo, skipped.Reason)
 		}
@@ -3020,10 +4272,70 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	token, err := resolveToken(cfg.token, cfg.baseURL)
+	token, err := resolveToken(cfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "error: %v\n", err)
 		return 1
+	}
+
+	if cfg.provider == circleCIProvider {
+		client := newCircleCIClient(cfg.baseURL, token, cfg.maxRetries, cfg.verbose)
+		client.setAPIWorkers(cfg.apiWorkers)
+		client.debug = cfg.debug
+		client.logWriter = stderr
+		client.requestDelay = time.Duration(cfg.requestDelayMS) * time.Millisecond
+		client.logf("resolving CircleCI project targets")
+		targetProjects, err := resolveCircleCIProjects(cfg)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+		if len(targetProjects) == 0 {
+			fmt.Fprintln(stderr, "error: no CircleCI projects matched the requested targets.")
+			return 1
+		}
+		client.logf("resolved %d CircleCI projects", len(targetProjects))
+		cfg.circleCIProjects = targetProjects
+		cfg.repos = targetProjects
+
+		progress := newProgressReporterForProvider(stderr, cfg.verbose, len(cfg.circleCIProjects), circleCIProvider)
+		progress.Begin()
+		records, summary, err := collectCircleCIProjects(client, cfg.circleCIProjects, collectOptions{
+			Since:              cfg.since,
+			Until:              cfg.until,
+			IncludeInProgress:  cfg.includeInProgress,
+			Branch:             cfg.branch,
+			APIWorkers:         cfg.apiWorkers,
+			CircleCIJobDetails: cfg.circleCIJobDetails,
+			CircleCIMaxPages:   cfg.circleCIMaxPages,
+		}, progress, stderr)
+		progress.Complete()
+		if err != nil {
+			var ae authError
+			if errors.As(err, &ae) {
+				fmt.Fprintln(stderr, "error: 401 unauthorized. Check CircleCI token scope and validity.")
+				return 1
+			}
+			fmt.Fprintf(stderr, "error: %v\n", err)
+			return 1
+		}
+		if len(records) == 0 {
+			fmt.Fprintln(stderr, "error: no completed CircleCI jobs found in that window.")
+			return 1
+		}
+
+		rep := buildReport(records, cfg, time.Since(started), summary, client.statsSnapshot())
+		if cfg.format == "json" {
+			enc := json.NewEncoder(stdout)
+			enc.SetIndent("", "  ")
+			if err := enc.Encode(rep); err != nil {
+				fmt.Fprintf(stderr, "error: %v\n", err)
+				return 1
+			}
+			return 0
+		}
+		printText(stdout, rep)
+		return 0
 	}
 
 	client := newGitHubClient(cfg.baseURL, token, cfg.maxRetries, cfg.verbose)
