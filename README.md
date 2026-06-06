@@ -182,12 +182,35 @@ gh concurrency \
   --estimate
 ```
 
-Estimated mode still resolves repositories exactly, then lists workflow runs
-and samples workflow-run jobs under a request budget. It builds reusable job
-shapes from sampled runs and runs a Monte Carlo simulation to produce intervals:
+Estimated mode still resolves repositories exactly, then builds a repository
+landscape before sampling. The landscape ranks repositories primarily by
+Actions workflow-run activity in the selected window, with repository metadata
+such as size and recent pushes as tie-breakers and fallback signals. Without
+extra flags, all repositories remain eligible, but the estimate scans them in
+ranked order so request-budget stops spend API calls on the busiest repos first.
+When the request budget is tight, the landscape is marked partial and ranking
+falls back to the metadata already available.
+
+Set `--estimate-repo-limit N` to focus the estimate on only the top-ranked
+repositories:
+
+```bash
+gh concurrency \
+  --org owner \
+  --since 2025-05-01 \
+  --estimate \
+  --estimate-repo-limit 50
+```
+
+After ranking repositories, estimate mode lists workflow runs and samples
+workflow-run jobs under the request budget. It builds reusable job shapes from
+sampled runs and runs a Monte Carlo simulation to produce intervals:
 
 ```text
 ESTIMATE MODE: sampled 250 of 3,412 known workflow runs; 90% simulation interval; seed 12345
+
+Repository landscape: ranked 1,000 repos, selected 50, limit 50, probes complete
+  #1 owner/api                            runs   14,230  size  180,301  pushed 2025-05-01  selected
 
 Jobs analyzed:        median 12,340 (90% range 10,900-15,100)
 Peak concurrency:     median 146 (90% range 105-230)
@@ -204,6 +227,7 @@ gh concurrency \
   --estimate-max-requests 750 \
   --estimate-min-remaining 500 \
   --estimate-sample-runs 200 \
+  --estimate-repo-limit 50 \
   --estimate-seed 12345
 ```
 
@@ -211,6 +235,9 @@ Estimated output is intentionally labeled as sampled simulation data. It is
 useful for sizing conversations and deciding whether a full exact scan is worth
 spending API quota on, but run exact mode before final commitments. Absolute
 peak concurrency is especially sensitive to rare unsampled fan-out.
+JSON output includes `estimate.repository_landscape` with each repo's rank,
+workflow-run count when known, metadata signals, and selected/not-selected
+status.
 
 ### GitHub Enterprise Server
 

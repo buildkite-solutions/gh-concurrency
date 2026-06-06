@@ -76,6 +76,7 @@ type config struct {
 	estimateIterations   int
 	estimateConfidence   int
 	estimateSeed         int64
+	estimateRepoLimit    int
 	verbose              bool
 	debug                bool
 	showVer              bool
@@ -136,6 +137,7 @@ func parseArgs(argv []string, stderr io.Writer) (config, error) {
 	fs.IntVar(&cfg.estimateIterations, "estimate-iterations", 1000, "GitHub estimate-only: Monte Carlo iterations")
 	fs.IntVar(&cfg.estimateConfidence, "estimate-confidence", 90, "GitHub estimate-only: confidence interval percentage")
 	fs.Int64Var(&cfg.estimateSeed, "estimate-seed", 0, "GitHub estimate-only: random seed; default is generated and printed")
+	fs.IntVar(&cfg.estimateRepoLimit, "estimate-repo-limit", 0, "GitHub estimate-only: rank repositories first and only estimate the top N; 0 keeps all repositories")
 	fs.BoolVar(&cfg.verbose, "verbose", false, "progress and rate-limit logging to stderr")
 	fs.BoolVar(&cfg.verbose, "v", false, "alias for --verbose")
 	fs.BoolVar(&cfg.debug, "debug", false, "HTTP request and pagination diagnostics to stderr; implies --verbose")
@@ -192,6 +194,9 @@ func parseArgs(argv []string, stderr io.Writer) (config, error) {
 	}
 	if cfg.estimateConfidence > 99 {
 		cfg.estimateConfidence = 99
+	}
+	if cfg.estimateRepoLimit < 0 {
+		cfg.estimateRepoLimit = 0
 	}
 	if cfg.debug {
 		cfg.verbose = true
@@ -370,6 +375,7 @@ func estimateKnobFlags() []string {
 		"estimate-iterations",
 		"estimate-confidence",
 		"estimate-seed",
+		"estimate-repo-limit",
 	}
 }
 
@@ -494,12 +500,18 @@ type skippedRepository struct {
 }
 
 func resolveTargetRepos(client *githubClient, cfg config, stderr io.Writer) ([]string, []skippedRepository, error) {
+	repos, _, skipped, err := resolveTargetReposWithInfo(client, cfg, stderr)
+	return repos, skipped, err
+}
+
+func resolveTargetReposWithInfo(client *githubClient, cfg config, stderr io.Writer) ([]string, map[string]repositoryInfo, []skippedRepository, error) {
 	var repos []string
 	var skipped []skippedRepository
 	var directRepos []string
+	repoInfos := map[string]repositoryInfo{}
 	for _, repo := range cfg.repos {
 		if err := validateRepo(repo); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		directRepos = append(directRepos, repo)
 	}
@@ -507,31 +519,35 @@ func resolveTargetRepos(client *githubClient, cfg config, stderr io.Writer) ([]s
 	for _, path := range cfg.repoFiles {
 		fileRepos, err := readListFile(path)
 		if err != nil {
-			return nil, nil, fmt.Errorf("read --repo-file %s: %w", path, err)
+			return nil, nil, nil, fmt.Errorf("read --repo-file %s: %w", path, err)
 		}
 		for _, repo := range fileRepos {
 			if err := validateRepo(repo); err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			directRepos = append(directRepos, repo)
 		}
 	}
-	filteredDirectRepos, directSkipped, err := resolveDirectRepos(client, directRepos, cfg.includeArchived, stderr)
+	filteredDirectRepos, directSkipped, err := resolveDirectRepoInfos(client, directRepos, cfg.includeArchived, stderr)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	skipped = append(skipped, directSkipped...)
-	repos = append(repos, filteredDirectRepos...)
+	for _, info := range filteredDirectRepos {
+		if name := rememberRepositoryInfo(repoInfos, info); name != "" {
+			repos = append(repos, name)
+		}
+	}
 
 	orgs := append([]string{}, cfg.orgs...)
 	for _, path := range cfg.orgFiles {
 		fileOrgs, err := readListFile(path)
 		if err != nil {
-			return nil, nil, fmt.Errorf("read --org-file %s: %w", path, err)
+			return nil, nil, nil, fmt.Errorf("read --org-file %s: %w", path, err)
 		}
 		for _, org := range fileOrgs {
 			if err := validateOrg(org); err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 			orgs = append(orgs, org)
 		}
@@ -539,16 +555,20 @@ func resolveTargetRepos(client *githubClient, cfg config, stderr io.Writer) ([]s
 
 	for _, org := range uniqueStrings(orgs) {
 		client.logf("listing repositories for org %s", org)
-		orgRepos, orgSkipped, err := listOrgRepos(client, org, cfg.repoType, cfg.includeArchived)
+		orgRepos, orgSkipped, err := listOrgRepoInfos(client, org, cfg.repoType, cfg.includeArchived)
 		if err != nil {
 			var nf notFoundError
 			if errors.As(err, &nf) {
 				fmt.Fprintf(stderr, "warning: org %s not found or no repository access; skipping.\n", org)
 				continue
 			}
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		repos = append(repos, orgRepos...)
+		for _, info := range orgRepos {
+			if name := rememberRepositoryInfo(repoInfos, info); name != "" {
+				repos = append(repos, name)
+			}
+		}
 		skipped = append(skipped, orgSkipped...)
 	}
 
@@ -557,7 +577,7 @@ func resolveTargetRepos(client *githubClient, cfg config, stderr io.Writer) ([]s
 		return strings.ToLower(repos[i]) < strings.ToLower(repos[j])
 	})
 	sortSkippedRepositories(skipped)
-	return repos, skipped, nil
+	return repos, repoInfos, skipped, nil
 }
 
 func resolveCircleCIProjects(cfg config) ([]string, error) {
@@ -625,11 +645,15 @@ func circleCIProjectFromRepo(vcs, repo string) (string, error) {
 	return project, nil
 }
 
-func resolveDirectRepos(client *githubClient, repos []string, includeArchived bool, stderr io.Writer) ([]string, []skippedRepository, error) {
+func resolveDirectRepoInfos(client *githubClient, repos []string, includeArchived bool, stderr io.Writer) ([]repositoryInfo, []skippedRepository, error) {
 	if includeArchived {
-		return repos, nil, nil
+		var out []repositoryInfo
+		for _, repo := range uniqueRepos(repos) {
+			out = append(out, repositoryInfo{FullName: repo})
+		}
+		return out, nil, nil
 	}
-	var out []string
+	var out []repositoryInfo
 	var skipped []skippedRepository
 	for _, repo := range uniqueRepos(repos) {
 		client.logf("%s: checking repository metadata", repo)
@@ -656,7 +680,7 @@ func resolveDirectRepos(client *githubClient, repos []string, includeArchived bo
 			skipped = append(skipped, skippedRepository{Repo: info.FullName, Reason: "archived"})
 			continue
 		}
-		out = append(out, info.FullName)
+		out = append(out, info)
 	}
 	return out, skipped, nil
 }
@@ -707,9 +731,18 @@ func uniqueRepos(repos []string) []string {
 }
 
 type repositoryInfo struct {
-	FullName string `json:"full_name"`
-	Disabled bool   `json:"disabled"`
-	Archived bool   `json:"archived"`
+	FullName        string `json:"full_name"`
+	Disabled        bool   `json:"disabled"`
+	Archived        bool   `json:"archived"`
+	Size            int    `json:"size"`
+	PushedAt        string `json:"pushed_at"`
+	UpdatedAt       string `json:"updated_at"`
+	OpenIssuesCount int    `json:"open_issues_count"`
+	StargazersCount int    `json:"stargazers_count"`
+	ForksCount      int    `json:"forks_count"`
+	DefaultBranch   string `json:"default_branch"`
+	Fork            bool   `json:"fork"`
+	Private         bool   `json:"private"`
 }
 
 func getRepoInfo(client *githubClient, repo string) (repositoryInfo, error) {
@@ -729,6 +762,20 @@ func getRepoInfo(client *githubClient, repo string) (repositoryInfo, error) {
 }
 
 func listOrgRepos(client *githubClient, org, repoType string, includeArchived bool) ([]string, []skippedRepository, error) {
+	infos, skipped, err := listOrgRepoInfos(client, org, repoType, includeArchived)
+	if err != nil {
+		return nil, nil, err
+	}
+	var repos []string
+	for _, info := range infos {
+		if info.FullName != "" {
+			repos = append(repos, info.FullName)
+		}
+	}
+	return repos, skipped, nil
+}
+
+func listOrgRepoInfos(client *githubClient, org, repoType string, includeArchived bool) ([]repositoryInfo, []skippedRepository, error) {
 	if err := validateOrg(org); err != nil {
 		return nil, nil, err
 	}
@@ -737,7 +784,7 @@ func listOrgRepos(client *githubClient, org, repoType string, includeArchived bo
 		"sort":      []string{"full_name"},
 		"direction": []string{"asc"},
 	}
-	var repos []string
+	var repos []repositoryInfo
 	var skipped []skippedRepository
 	err := client.paginate("/orgs/"+url.PathEscape(org)+"/repos", params, "", func(raw json.RawMessage) error {
 		var repo repositoryInfo
@@ -755,13 +802,27 @@ func listOrgRepos(client *githubClient, org, repoType string, includeArchived bo
 			skipped = append(skipped, skippedRepository{Repo: repo.FullName, Reason: "archived"})
 			return nil
 		}
-		repos = append(repos, repo.FullName)
+		repos = append(repos, repo)
 		return nil
 	})
 	if err != nil {
 		return nil, nil, err
 	}
 	return repos, skipped, nil
+}
+
+func rememberRepositoryInfo(infos map[string]repositoryInfo, info repositoryInfo) string {
+	name := strings.TrimSpace(info.FullName)
+	if name == "" {
+		return ""
+	}
+	info.FullName = name
+	infos[repoInfoKey(name)] = info
+	return name
+}
+
+func repoInfoKey(repo string) string {
+	return strings.ToLower(strings.TrimSpace(repo))
 }
 
 func envToken() string {
@@ -2406,22 +2467,53 @@ type estimateMetrics struct {
 	PercentileConcurrency map[string]estimateInterval `json:"percentile_concurrency"`
 }
 
+type estimateRepositoryLandscape struct {
+	Strategy      string                     `json:"strategy"`
+	RepoLimit     int                        `json:"repo_limit"`
+	RankedRepos   int                        `json:"ranked_repos"`
+	SelectedRepos int                        `json:"selected_repos"`
+	ProbeComplete bool                       `json:"probe_complete"`
+	StopReason    string                     `json:"stop_reason,omitempty"`
+	Repositories  []estimateRepositorySignal `json:"repositories"`
+}
+
+type estimateRepositorySignal struct {
+	Rank                  int     `json:"rank"`
+	Repo                  string  `json:"repo"`
+	Score                 float64 `json:"score"`
+	WorkflowRunCount      int     `json:"workflow_run_count"`
+	WorkflowRunCountKnown bool    `json:"workflow_run_count_known"`
+	Size                  int     `json:"size"`
+	PushedAt              string  `json:"pushed_at,omitempty"`
+	UpdatedAt             string  `json:"updated_at,omitempty"`
+	OpenIssuesCount       int     `json:"open_issues_count"`
+	StargazersCount       int     `json:"stargazers_count"`
+	ForksCount            int     `json:"forks_count"`
+	DefaultBranch         string  `json:"default_branch,omitempty"`
+	Fork                  bool    `json:"fork"`
+	Private               bool    `json:"private"`
+	Selected              bool    `json:"selected"`
+	SelectionReason       string  `json:"selection_reason"`
+}
+
 type estimateReport struct {
-	Seed               int64           `json:"seed"`
-	Confidence         int             `json:"confidence"`
-	Iterations         int             `json:"iterations"`
-	RequestBudget      int             `json:"request_budget"`
-	MinRemaining       int             `json:"min_remaining"`
-	TargetSampleRuns   int             `json:"target_sample_runs"`
-	SampledRuns        int             `json:"sampled_runs"`
-	UnsampledRuns      int             `json:"unsampled_runs"`
-	KnownRuns          int             `json:"known_runs"`
-	EstimatedTotalRuns int             `json:"estimated_total_runs"`
-	SampleFraction     float64         `json:"sample_fraction"`
-	CensusCompleteness float64         `json:"census_completeness"`
-	StopReason         string          `json:"stop_reason,omitempty"`
-	Warnings           []string        `json:"warnings,omitempty"`
-	Metrics            estimateMetrics `json:"metrics"`
+	Seed                int64                        `json:"seed"`
+	Confidence          int                          `json:"confidence"`
+	Iterations          int                          `json:"iterations"`
+	RequestBudget       int                          `json:"request_budget"`
+	MinRemaining        int                          `json:"min_remaining"`
+	RepoLimit           int                          `json:"repo_limit"`
+	TargetSampleRuns    int                          `json:"target_sample_runs"`
+	SampledRuns         int                          `json:"sampled_runs"`
+	UnsampledRuns       int                          `json:"unsampled_runs"`
+	KnownRuns           int                          `json:"known_runs"`
+	EstimatedTotalRuns  int                          `json:"estimated_total_runs"`
+	SampleFraction      float64                      `json:"sample_fraction"`
+	CensusCompleteness  float64                      `json:"census_completeness"`
+	StopReason          string                       `json:"stop_reason,omitempty"`
+	Warnings            []string                     `json:"warnings,omitempty"`
+	Metrics             estimateMetrics              `json:"metrics"`
+	RepositoryLandscape *estimateRepositoryLandscape `json:"repository_landscape,omitempty"`
 }
 
 func collectRepositories(client *githubClient, repos []string, opts collectOptions, progress *progressReporter, skipped []skippedRepository, stderr io.Writer) ([]record, scanSummary, error) {
@@ -3137,7 +3229,269 @@ type simulationMetric struct {
 	P99          int
 }
 
-func runEstimate(client *githubClient, cfg config, skipped []skippedRepository, started time.Time, stderr io.Writer) (report, error) {
+func buildEstimateRepositoryLandscape(client *githubClient, repos []string, repoInfos map[string]repositoryInfo, opts collectOptions, cfg config, stderr io.Writer) (*estimateRepositoryLandscape, []string, []string, error) {
+	signals := make([]estimateRepositorySignal, 0, len(repos))
+	for _, repo := range repos {
+		info := repoInfos[repoInfoKey(repo)]
+		if info.FullName == "" {
+			info.FullName = repo
+		}
+		signals = append(signals, signalFromRepositoryInfo(info))
+	}
+	if len(signals) == 0 {
+		return &estimateRepositoryLandscape{
+			Strategy:      "actions_runs_then_metadata",
+			RepoLimit:     cfg.estimateRepoLimit,
+			ProbeComplete: true,
+		}, nil, nil, nil
+	}
+
+	signalIndex := map[string]int{}
+	for i, signal := range signals {
+		signalIndex[repoInfoKey(signal.Repo)] = i
+	}
+
+	probeOrder := append([]estimateRepositorySignal{}, signals...)
+	sortRepositorySignalsForProbe(probeOrder)
+	probeLimit := estimateLandscapeProbeLimit(len(probeOrder), cfg)
+
+	probeComplete := true
+	stopReason := ""
+	var warnings []string
+	probesAttempted := 0
+probeLoop:
+	for _, probe := range probeOrder {
+		if probesAttempted >= probeLimit {
+			probeComplete = false
+			stopReason = fmt.Sprintf("repository landscape probe cap reached after %d repositories to preserve estimate request budget", probeLimit)
+			break
+		}
+		probesAttempted++
+		idx := signalIndex[repoInfoKey(probe.Repo)]
+		if !hasRepositoryMetadata(signals[idx]) {
+			info, err := getRepoInfo(client, signals[idx].Repo)
+			if err != nil {
+				var stopErr requestBudgetStopError
+				var nf notFoundError
+				var ae authError
+				switch {
+				case errors.As(err, &stopErr):
+					probeComplete = false
+					stopReason = stopErr.Reason
+					break probeLoop
+				case errors.As(err, &nf):
+					warning := fmt.Sprintf("%s metadata was unavailable during estimate landscape; ranking uses Actions activity when available.", signals[idx].Repo)
+					warnings = append(warnings, warning)
+					if stderr != nil {
+						fmt.Fprintf(stderr, "warning: %s\n", warning)
+					}
+				case errors.As(err, &ae):
+					return nil, nil, nil, authError{}
+				default:
+					return nil, nil, nil, err
+				}
+			} else {
+				if info.FullName == "" {
+					info.FullName = signals[idx].Repo
+				}
+				signals[idx] = signalFromRepositoryInfo(info)
+			}
+		}
+
+		count, err := getWorkflowRunCountForEstimate(client, signals[idx].Repo, opts)
+		if err != nil {
+			var stopErr requestBudgetStopError
+			var nf notFoundError
+			var ae authError
+			switch {
+			case errors.As(err, &stopErr):
+				probeComplete = false
+				stopReason = stopErr.Reason
+				break probeLoop
+			case errors.As(err, &nf):
+				warning := fmt.Sprintf("%s Actions activity was unavailable during estimate landscape; ranking uses repository metadata only.", signals[idx].Repo)
+				warnings = append(warnings, warning)
+				if stderr != nil {
+					fmt.Fprintf(stderr, "warning: %s\n", warning)
+				}
+			case errors.As(err, &ae):
+				return nil, nil, nil, authError{}
+			default:
+				return nil, nil, nil, err
+			}
+			continue
+		}
+		signals[idx].WorkflowRunCount = count
+		signals[idx].WorkflowRunCountKnown = true
+	}
+
+	for i := range signals {
+		signals[i].Score = roundFloat(repositorySignalScore(signals[i]), 3)
+	}
+	sortRepositorySignalsByRank(signals)
+
+	limit := cfg.estimateRepoLimit
+	selectedRepos := make([]string, 0, len(signals))
+	for i := range signals {
+		signals[i].Rank = i + 1
+		selected := limit == 0 || i < limit
+		signals[i].Selected = selected
+		switch {
+		case selected && limit > 0:
+			signals[i].SelectionReason = fmt.Sprintf("selected by --estimate-repo-limit=%d", limit)
+		case selected:
+			signals[i].SelectionReason = "selected; no repository limit"
+		default:
+			signals[i].SelectionReason = fmt.Sprintf("outside --estimate-repo-limit=%d", limit)
+		}
+		if selected {
+			selectedRepos = append(selectedRepos, signals[i].Repo)
+		}
+	}
+	if !probeComplete {
+		warning := "repository landscape probing stopped before all candidate repositories were probed; ranking uses available Actions counts and repository metadata"
+		warnings = append(warnings, warning)
+	}
+
+	return &estimateRepositoryLandscape{
+		Strategy:      "actions_runs_then_metadata",
+		RepoLimit:     cfg.estimateRepoLimit,
+		RankedRepos:   len(signals),
+		SelectedRepos: len(selectedRepos),
+		ProbeComplete: probeComplete,
+		StopReason:    stopReason,
+		Repositories:  signals,
+	}, selectedRepos, warnings, nil
+}
+
+func signalFromRepositoryInfo(info repositoryInfo) estimateRepositorySignal {
+	return estimateRepositorySignal{
+		Repo:            info.FullName,
+		Size:            info.Size,
+		PushedAt:        info.PushedAt,
+		UpdatedAt:       info.UpdatedAt,
+		OpenIssuesCount: info.OpenIssuesCount,
+		StargazersCount: info.StargazersCount,
+		ForksCount:      info.ForksCount,
+		DefaultBranch:   info.DefaultBranch,
+		Fork:            info.Fork,
+		Private:         info.Private,
+	}
+}
+
+func estimateLandscapeProbeLimit(repoCount int, cfg config) int {
+	if repoCount <= 0 {
+		return 0
+	}
+	if cfg.estimateMaxRequests <= 0 {
+		return repoCount
+	}
+	sampleReserve := cfg.estimateSampleRuns
+	if sampleReserve < 1 {
+		sampleReserve = 1
+	}
+	censusReserve := sampleReserve
+	if cfg.estimateRepoLimit > 0 {
+		censusReserve = min(cfg.estimateRepoLimit, repoCount)
+	}
+	reserve := sampleReserve + max(censusReserve, 1)
+	limit := cfg.estimateMaxRequests - reserve
+	if limit < 0 {
+		limit = 0
+	}
+	return min(repoCount, limit)
+}
+
+func hasRepositoryMetadata(signal estimateRepositorySignal) bool {
+	return signal.Size > 0 ||
+		signal.PushedAt != "" ||
+		signal.UpdatedAt != "" ||
+		signal.OpenIssuesCount > 0 ||
+		signal.StargazersCount > 0 ||
+		signal.ForksCount > 0 ||
+		signal.DefaultBranch != ""
+}
+
+func getWorkflowRunCountForEstimate(client *githubClient, repo string, opts collectOptions) (int, error) {
+	repoPath, err := repoAPIPath(repo)
+	if err != nil {
+		return 0, err
+	}
+	params := workflowRunParams(opts)
+	params.Set("per_page", "1")
+	body, _, err := client.request(client.baseURL + repoPath + "/actions/runs?" + params.Encode())
+	if err != nil {
+		return 0, err
+	}
+	var page workflowRunPage
+	if err := json.Unmarshal(body, &page); err != nil {
+		return 0, err
+	}
+	if page.TotalCount > 0 {
+		return page.TotalCount, nil
+	}
+	return len(page.WorkflowRuns), nil
+}
+
+func sortRepositorySignalsForProbe(signals []estimateRepositorySignal) {
+	sort.SliceStable(signals, func(i, j int) bool {
+		left := repositoryMetadataScore(signals[i])
+		right := repositoryMetadataScore(signals[j])
+		if left != right {
+			return left > right
+		}
+		return strings.ToLower(signals[i].Repo) < strings.ToLower(signals[j].Repo)
+	})
+}
+
+func sortRepositorySignalsByRank(signals []estimateRepositorySignal) {
+	sort.SliceStable(signals, func(i, j int) bool {
+		if signals[i].Score != signals[j].Score {
+			return signals[i].Score > signals[j].Score
+		}
+		if signals[i].WorkflowRunCountKnown != signals[j].WorkflowRunCountKnown {
+			return signals[i].WorkflowRunCountKnown
+		}
+		if signals[i].WorkflowRunCount != signals[j].WorkflowRunCount {
+			return signals[i].WorkflowRunCount > signals[j].WorkflowRunCount
+		}
+		if signals[i].Size != signals[j].Size {
+			return signals[i].Size > signals[j].Size
+		}
+		return strings.ToLower(signals[i].Repo) < strings.ToLower(signals[j].Repo)
+	})
+}
+
+func repositorySignalScore(signal estimateRepositorySignal) float64 {
+	score := repositoryMetadataScore(signal)
+	if signal.WorkflowRunCountKnown {
+		score += float64(signal.WorkflowRunCount) * 1_000_000_000
+	}
+	return score
+}
+
+func repositoryMetadataScore(signal estimateRepositorySignal) float64 {
+	score := math.Log1p(float64(max(signal.Size, 0))) * 1000
+	score += math.Log1p(float64(max(signal.OpenIssuesCount, 0))) * 200
+	score += math.Log1p(float64(max(signal.StargazersCount, 0))) * 100
+	score += math.Log1p(float64(max(signal.ForksCount, 0))) * 100
+	score += repositoryTimestampScore(signal.PushedAt)
+	score += repositoryTimestampScore(signal.UpdatedAt) / 2
+	return score
+}
+
+func repositoryTimestampScore(value string) float64 {
+	if value == "" {
+		return 0
+	}
+	t, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		return 0
+	}
+	return float64(t.Unix()) / float64(86400*100)
+}
+
+func runEstimate(client *githubClient, cfg config, repoInfos map[string]repositoryInfo, skipped []skippedRepository, started time.Time, stderr io.Writer) (report, error) {
 	if cfg.estimateSeed == 0 {
 		cfg.estimateSeed = time.Now().UnixNano()
 	}
@@ -3154,6 +3508,11 @@ func runEstimate(client *githubClient, cfg config, skipped []skippedRepository, 
 		ExcludePullRequests: cfg.excludePullRequests,
 		APIWorkers:          cfg.apiWorkers,
 	}
+	landscape, selectedRepos, landscapeWarnings, err := buildEstimateRepositoryLandscape(client, cfg.repos, repoInfos, opts, cfg, stderr)
+	if err != nil {
+		return report{}, err
+	}
+	cfg.repos = selectedRepos
 	runs, estimatedTotalRuns, censusComplete, summary, stopReason, err := collectWorkflowRunCensus(client, cfg.repos, opts, skipped, stderr)
 	if err != nil {
 		return report{}, err
@@ -3190,6 +3549,7 @@ func runEstimate(client *githubClient, cfg config, skipped []skippedRepository, 
 	}
 
 	metrics, warnings := simulateEstimate(runs, sampled, cfg)
+	warnings = append(landscapeWarnings, warnings...)
 	if stopReason == "" {
 		stopReason = client.requestBudgetStopReason()
 	}
@@ -3218,21 +3578,23 @@ func runEstimate(client *githubClient, cfg config, skipped []skippedRepository, 
 		estimatedTotal = knownRuns
 	}
 	estimate := &estimateReport{
-		Seed:               cfg.estimateSeed,
-		Confidence:         cfg.estimateConfidence,
-		Iterations:         cfg.estimateIterations,
-		RequestBudget:      cfg.estimateMaxRequests,
-		MinRemaining:       cfg.estimateMinRemaining,
-		TargetSampleRuns:   cfg.estimateSampleRuns,
-		SampledRuns:        len(sampled),
-		UnsampledRuns:      max(0, knownRuns-len(sampled)),
-		KnownRuns:          knownRuns,
-		EstimatedTotalRuns: estimatedTotal,
-		SampleFraction:     roundFloat(float64(len(sampled))/float64(knownRuns), 4),
-		CensusCompleteness: roundFloat(censusCompletenessRatio(knownRuns, estimatedTotal, censusComplete), 4),
-		StopReason:         stopReason,
-		Warnings:           warnings,
-		Metrics:            metrics,
+		Seed:                cfg.estimateSeed,
+		Confidence:          cfg.estimateConfidence,
+		Iterations:          cfg.estimateIterations,
+		RequestBudget:       cfg.estimateMaxRequests,
+		MinRemaining:        cfg.estimateMinRemaining,
+		RepoLimit:           cfg.estimateRepoLimit,
+		TargetSampleRuns:    cfg.estimateSampleRuns,
+		SampledRuns:         len(sampled),
+		UnsampledRuns:       max(0, knownRuns-len(sampled)),
+		KnownRuns:           knownRuns,
+		EstimatedTotalRuns:  estimatedTotal,
+		SampleFraction:      roundFloat(float64(len(sampled))/float64(knownRuns), 4),
+		CensusCompleteness:  roundFloat(censusCompletenessRatio(knownRuns, estimatedTotal, censusComplete), 4),
+		StopReason:          stopReason,
+		Warnings:            warnings,
+		Metrics:             metrics,
+		RepositoryLandscape: landscape,
 	}
 
 	rep := report{
@@ -3845,6 +4207,7 @@ type parameters struct {
 	EstimateIterations   int      `json:"estimate_iterations,omitempty"`
 	EstimateConfidence   int      `json:"estimate_confidence,omitempty"`
 	EstimateSeed         int64    `json:"estimate_seed,omitempty"`
+	EstimateRepoLimit    int      `json:"estimate_repo_limit,omitempty"`
 }
 
 type report struct {
@@ -3963,6 +4326,7 @@ func buildParameters(cfg config) parameters {
 		params.EstimateIterations = cfg.estimateIterations
 		params.EstimateConfidence = cfg.estimateConfidence
 		params.EstimateSeed = cfg.estimateSeed
+		params.EstimateRepoLimit = cfg.estimateRepoLimit
 	}
 	return params
 }
@@ -4119,6 +4483,7 @@ func printEstimateText(out io.Writer, rep report) {
 	if est.StopReason != "" {
 		fmt.Fprintf(out, "Stopped early: %s\n", est.StopReason)
 	}
+	printEstimateLandscapeText(out, est.RepositoryLandscape, rep.Parameters.Top)
 	fmt.Fprintf(out, "\nJobs analyzed:        median %s (%d%% range %s-%s)\n",
 		formatEstimateNumber(est.Metrics.JobsAnalyzed.Median),
 		est.Confidence,
@@ -4147,6 +4512,57 @@ func printEstimateText(out io.Writer, rep report) {
 	for _, warning := range est.Warnings {
 		fmt.Fprintf(out, "  WARNING: %s\n", warning)
 	}
+}
+
+func printEstimateLandscapeText(out io.Writer, landscape *estimateRepositoryLandscape, top int) {
+	if landscape == nil || len(landscape.Repositories) == 0 {
+		return
+	}
+	limit := "all"
+	if landscape.RepoLimit > 0 {
+		limit = strconv.Itoa(landscape.RepoLimit)
+	}
+	status := "complete"
+	if !landscape.ProbeComplete {
+		status = "partial"
+	}
+	fmt.Fprintf(out, "\nRepository landscape: ranked %d repos, selected %d, limit %s, probes %s\n",
+		landscape.RankedRepos, landscape.SelectedRepos, limit, status)
+	if top <= 0 {
+		return
+	}
+	shown := min(top, len(landscape.Repositories))
+	for _, repo := range landscape.Repositories[:shown] {
+		runs := "unknown"
+		if repo.WorkflowRunCountKnown {
+			runs = comma(repo.WorkflowRunCount)
+		}
+		selected := "not selected"
+		if repo.Selected {
+			selected = "selected"
+		}
+		fmt.Fprintf(out, "  #%d %-36s runs %8s  size %7s  pushed %-10s  %s\n",
+			repo.Rank,
+			truncate(repo.Repo, 36),
+			runs,
+			comma(repo.Size),
+			formatRepositoryLandscapeDate(repo.PushedAt),
+			selected,
+		)
+	}
+}
+
+func formatRepositoryLandscapeDate(value string) string {
+	if value == "" {
+		return "-"
+	}
+	if t, err := time.Parse(time.RFC3339, value); err == nil {
+		return t.Format("2006-01-02")
+	}
+	if len(value) >= len("2006-01-02") {
+		return value[:len("2006-01-02")]
+	}
+	return value
 }
 
 func formatEstimateNumber(value float64) string {
@@ -4344,7 +4760,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	client.logWriter = stderr
 	client.requestDelay = time.Duration(cfg.requestDelayMS) * time.Millisecond
 	client.logf("resolving repository targets")
-	targetRepos, skippedRepos, err := resolveTargetRepos(client, cfg, stderr)
+	targetRepos, repoInfos, skippedRepos, err := resolveTargetReposWithInfo(client, cfg, stderr)
 	if err != nil {
 		var ae authError
 		if errors.As(err, &ae) {
@@ -4362,7 +4778,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	cfg.repos = targetRepos
 
 	if cfg.estimate {
-		rep, err := runEstimate(client, cfg, skippedRepos, started, stderr)
+		rep, err := runEstimate(client, cfg, repoInfos, skippedRepos, started, stderr)
 		if err != nil {
 			var ae authError
 			if errors.As(err, &ae) {
