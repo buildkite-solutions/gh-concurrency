@@ -1,14 +1,14 @@
 # gh-concurrency
 
-Estimate how many GitHub Actions jobs run at the same time, so you can compare
-GitHub's per-minute billing model with a concurrency-based model like
+Estimate how many CI jobs run at the same time, so you can compare
+GitHub Actions or CircleCI usage with a concurrency-based model like
 Buildkite's.
 
-GitHub Actions bills for the area under your usage curve. Buildkite plans are
-sized around the height of that curve. GitHub's billing and metrics views do
-not report concurrency directly, so `gh-concurrency` reconstructs it from job
-start and finish timestamps, then reports peak concurrency plus time-weighted
-percentiles.
+GitHub Actions bills for the area under your usage curve. CircleCI exposes job
+history, but not a single cross-project concurrency profile. Buildkite plans
+are sized around the height of that curve, so `gh-concurrency` reconstructs it
+from job start and finish timestamps, then reports peak concurrency plus
+time-weighted percentiles.
 
 The tool is a dependency-free Go binary. It makes authenticated `GET` requests
 only, never logs your token, and works either as a GitHub CLI extension or as a
@@ -17,8 +17,8 @@ container image.
 ## For Users: Run The Estimator
 
 This section is for people who want to install `gh-concurrency`, point it at
-their GitHub repositories or organizations, and read the resulting concurrency
-profile.
+their GitHub repositories, GitHub organizations, or CircleCI projects, and read
+the resulting concurrency profile.
 
 ### Install
 
@@ -111,10 +111,56 @@ run job attempts (`--job-filter all`). Use `--include-in-progress` to include
 queued/running workflow runs in the scan, or `--job-filter latest` if you only
 want the latest attempt for each workflow run.
 
+### CircleCI Projects
+
+CircleCI scans are project-scoped. Use a personal API token through
+`CIRCLECI_TOKEN`, `CIRCLE_TOKEN`, or `--token`, then pass
+`--provider circleci`:
+
+```bash
+# Full CircleCI project slug.
+gh concurrency \
+  --provider circleci \
+  --circleci-project gh/owner/name \
+  --since 2025-05-01
+
+# GitHub-backed CircleCI projects can use --repo as a shorthand for gh/owner/name.
+gh concurrency \
+  --provider circleci \
+  --repo owner/name \
+  --since 2025-05-01
+
+# Bitbucket-backed shorthand.
+gh concurrency \
+  --provider circleci \
+  --circleci-vcs bb \
+  --repo workspace/repo \
+  --since 2025-05-01
+```
+
+Use `--circleci-project` for GitHub App, GitLab, or standalone projects whose
+slug uses `circleci/<org-id>/<project-id>`. You can repeat
+`--circleci-project`, mix it with `--repo`, or load slugs from
+`--circleci-project-file`.
+
+CircleCI project pipeline listing supports a branch filter, so `--branch main`
+works for CircleCI too. The project pipeline endpoint does not provide a
+server-side date range filter, so the tool pages through project pipelines,
+filters by `--since`/`--until` locally, and stops once it reaches older
+pipelines. Add `--circleci-max-pages N` to cap API spend per project when you
+only need a quick first pass.
+
+By default, CircleCI scans fetch per-job details so resource class, executor,
+queue time, and `parallelism` are reflected in runner pools and concurrency.
+Pass `--circleci-job-details=false` for fewer API requests; parallel jobs may
+then be undercounted because the workflow jobs list does not include all detail
+fields.
+
 ### Fast Estimated Mode
 
-If an exact organization scan is too expensive for the current GitHub API
-budget, use `--estimate` for a fast first pass:
+If an exact GitHub organization scan is too expensive for the current GitHub API
+budget, use `--estimate` for a fast first pass. Estimated mode is GitHub-only;
+CircleCI scans use the exact project workflow/job endpoints.
 
 ```bash
 gh concurrency \
@@ -179,6 +225,8 @@ docker run --rm \
 
 ### Token Scopes
 
+For GitHub scans:
+
 Use a fine-grained personal access token with read-only access:
 
 - `Actions: read`
@@ -190,6 +238,10 @@ deletes, or changes anything.
 For organization-wide scans, the token must be able to list the organization's
 repositories and read Actions metadata for each repository you want included.
 Repositories that are not found or not readable are skipped with a warning.
+
+For CircleCI scans, use a CircleCI personal API token. API v2 project tokens are
+not supported by CircleCI; set `CIRCLECI_TOKEN`, `CIRCLE_TOKEN`, or pass
+`--token`. The token must be able to read each CircleCI project you include.
 
 ### Reading The Output
 
@@ -223,9 +275,13 @@ Top repositories by busy time:
   jobs are grouped by OS; self-hosted and third-party runner platforms such as
   Blacksmith, RunsOn, or ARC are grouped by runner group when GitHub reports
   one, with a label-based fallback for common third-party runner labels.
+- CircleCI runner pools are grouped by resource class when per-job details are
+  enabled. Jobs with `parallelism` greater than one are expanded into multiple
+  concurrent slots for concurrency math.
 - The billable-minutes estimate re-derives GitHub-hosted Actions minutes by
   rounding each job up to the minute, then applying Linux x1, Windows x2, and
-  macOS x10 multipliers. Self-hosted jobs are treated as free.
+  macOS x10 multipliers. Self-hosted jobs are treated as free. This section is
+  omitted for CircleCI scans.
 - Queue-time warnings mean measured concurrency is probably a floor. If jobs
   waited in GitHub's queue, true demand was higher than observed concurrency.
 - The scan summary explains how much data was collected, which repositories
@@ -240,7 +296,7 @@ written to stderr so they do not corrupt JSON:
 # Show target resolution and a repo-by-repo progress bar.
 gh concurrency --org owner --since 2025-05-01 --verbose
 
-# Add exact GitHub API GET/page/rate-limit diagnostics.
+# Add exact API GET/page/rate-limit diagnostics.
 gh concurrency --org owner --since 2025-05-01 --debug
 ```
 
@@ -256,16 +312,16 @@ API access.
 
 ### Security Model
 
-- Read-only: authenticated `GET` requests only, scoped to the configured GitHub
-  API host.
-- The token is read from env, `--token`, or `gh auth token`; it is never written
-  to disk or logged.
+- Read-only: authenticated `GET` requests only, scoped to the configured API
+  host.
+- The token is read from env, `--token`, or GitHub's `gh auth token` fallback;
+  it is never written to disk or logged.
 - No telemetry and no third-party API calls.
 - The Docker image runs a static Go binary as UID `10001`.
 - The core implementation is small enough to audit in one sitting.
 
 Customers can run it themselves and share the JSON output. They never need to
-share their GitHub token.
+share their GitHub or CircleCI token.
 
 ## For Maintainers: Develop, Build, And Release
 
