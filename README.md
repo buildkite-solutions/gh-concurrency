@@ -156,6 +156,18 @@ Pass `--circleci-job-details=false` for fewer API requests; parallel jobs may
 then be undercounted because the workflow jobs list does not include all detail
 fields.
 
+### Flag Compatibility
+
+The CLI fails fast when a flag does not apply to the selected provider or mode.
+This includes explicit no-op defaults, such as `--job-filter all` with
+`--provider circleci` or `--circleci-vcs gh` with GitHub. Estimate tuning flags
+such as `--estimate-sample-runs` require `--estimate`, and estimate mode is
+GitHub-only.
+
+`--branch` is shared by GitHub and CircleCI. `--include-in-progress` is
+GitHub-only because CircleCI concurrency is measured from jobs with both
+`started_at` and `stopped_at`.
+
 ### Fast Estimated Mode
 
 If an exact GitHub organization scan is too expensive for the current GitHub API
