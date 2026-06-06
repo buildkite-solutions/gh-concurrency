@@ -517,11 +517,12 @@ func TestParseArgsEstimateFlags(t *testing.T) {
 		"--estimate-iterations", "89",
 		"--estimate-confidence", "80",
 		"--estimate-seed", "42",
+		"--estimate-repo-limit", "50",
 	}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.estimate || cfg.estimateMaxRequests != 123 || cfg.estimateMinRemaining != 45 || cfg.estimateSampleRuns != 67 || cfg.estimateIterations != 89 || cfg.estimateConfidence != 80 || cfg.estimateSeed != 42 {
+	if !cfg.estimate || cfg.estimateMaxRequests != 123 || cfg.estimateMinRemaining != 45 || cfg.estimateSampleRuns != 67 || cfg.estimateIterations != 89 || cfg.estimateConfidence != 80 || cfg.estimateSeed != 42 || cfg.estimateRepoLimit != 50 {
 		t.Fatalf("parsed estimate cfg = %#v", cfg)
 	}
 }
@@ -535,11 +536,12 @@ func TestParseArgsClampsEstimateFlags(t *testing.T) {
 		"--estimate-sample-runs", "0",
 		"--estimate-iterations", "0",
 		"--estimate-confidence", "120",
+		"--estimate-repo-limit", "-1",
 	}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.estimateMaxRequests != 1 || cfg.estimateMinRemaining != 0 || cfg.estimateSampleRuns != 1 || cfg.estimateIterations != 1 || cfg.estimateConfidence != 99 {
+	if cfg.estimateMaxRequests != 1 || cfg.estimateMinRemaining != 0 || cfg.estimateSampleRuns != 1 || cfg.estimateIterations != 1 || cfg.estimateConfidence != 99 || cfg.estimateRepoLimit != 0 {
 		t.Fatalf("clamped estimate cfg = %#v", cfg)
 	}
 }
@@ -578,6 +580,7 @@ func TestValidateConfigRejectsEstimateKnobsWithoutEstimate(t *testing.T) {
 		{name: "iterations", args: []string{"--estimate-iterations", "10"}},
 		{name: "confidence", args: []string{"--estimate-confidence", "80"}},
 		{name: "seed", args: []string{"--estimate-seed", "42"}},
+		{name: "repo limit", args: []string{"--estimate-repo-limit", "50"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -627,6 +630,7 @@ func TestValidateConfigAcceptsValidProviderModeCombinations(t *testing.T) {
 				"--estimate-iterations", "20",
 				"--estimate-confidence", "80",
 				"--estimate-seed", "42",
+				"--estimate-repo-limit", "50",
 			},
 		},
 		{
@@ -1050,6 +1054,188 @@ func TestListWorkflowRunsForEstimateParsesTotalCount(t *testing.T) {
 	}
 }
 
+func TestGetWorkflowRunCountForEstimatePassesFilters(t *testing.T) {
+	var checked bool
+	client := newGitHubClient("https://api.github.com", "tok", 1, false)
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/repos/o/r/actions/runs" {
+			t.Fatalf("unexpected path %s", req.URL.Path)
+		}
+		q := req.URL.Query()
+		for key, want := range map[string]string{
+			"created":               "2025-05-01..2025-05-02",
+			"status":                "completed",
+			"branch":                "main",
+			"event":                 "push",
+			"exclude_pull_requests": "true",
+			"per_page":              "1",
+		} {
+			if got := q.Get(key); got != want {
+				t.Fatalf("query %s = %q, want %q (full query %s)", key, got, want, req.URL.RawQuery)
+			}
+		}
+		checked = true
+		return fakeHTTPResponse(http.StatusOK, "200 OK", `{"total_count":7,"workflow_runs":[]}`, nil), nil
+	})}
+	client.sleep = func(time.Duration) {}
+
+	count, err := getWorkflowRunCountForEstimate(client, "o/r", collectOptions{
+		Since:               "2025-05-01",
+		Until:               "2025-05-02",
+		Branch:              "main",
+		Event:               "push",
+		ExcludePullRequests: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !checked || count != 7 {
+		t.Fatalf("checked/count = %v/%d, want true/7", checked, count)
+	}
+}
+
+func TestEstimateRepositoryLandscapeRanksAndSelectsByActionsActivity(t *testing.T) {
+	responses := map[string]fakeResponse{
+		"/repos/o/large/actions/runs": {body: map[string]any{"total_count": 40, "workflow_runs": []map[string]any{{"id": 1}}}},
+		"/repos/o/small/actions/runs": {body: map[string]any{"total_count": 200, "workflow_runs": []map[string]any{{"id": 2}}}},
+		"/repos/o/quiet/actions/runs": {body: map[string]any{"total_count": 1, "workflow_runs": []map[string]any{{"id": 3}}}},
+	}
+	client := newGitHubClient("https://api.github.com", "tok", 1, false)
+	client.httpClient = &http.Client{Transport: fakeTransport{responses: responses}}
+	client.sleep = func(time.Duration) {}
+
+	infos := map[string]repositoryInfo{
+		repoInfoKey("o/large"): {FullName: "o/large", Size: 500000, PushedAt: "2025-05-01T12:00:00Z", OpenIssuesCount: 10},
+		repoInfoKey("o/small"): {FullName: "o/small", Size: 100, PushedAt: "2025-05-01T12:00:00Z"},
+		repoInfoKey("o/quiet"): {FullName: "o/quiet", Size: 900000, PushedAt: "2025-05-01T12:00:00Z"},
+	}
+	landscape, selected, warnings, err := buildEstimateRepositoryLandscape(
+		client,
+		[]string{"o/quiet", "o/large", "o/small"},
+		infos,
+		collectOptions{Since: "2025-05-01"},
+		config{estimateRepoLimit: 2},
+		io.Discard,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %v, want empty", warnings)
+	}
+	if strings.Join(selected, ",") != "o/small,o/large" {
+		t.Fatalf("selected = %v, want small then large", selected)
+	}
+	if landscape.Repositories[0].Repo != "o/small" || landscape.Repositories[0].WorkflowRunCount != 200 || !landscape.Repositories[0].Selected {
+		t.Fatalf("top landscape entry = %#v", landscape.Repositories[0])
+	}
+	if landscape.Repositories[2].Selected {
+		t.Fatalf("third repo should not be selected: %#v", landscape.Repositories[2])
+	}
+}
+
+func TestEstimateRepositoryLandscapeDefaultKeepsAllReposButRanksThem(t *testing.T) {
+	responses := map[string]fakeResponse{
+		"/repos/o/busy/actions/runs":  {body: map[string]any{"total_count": 30, "workflow_runs": []map[string]any{{"id": 1}}}},
+		"/repos/o/quiet/actions/runs": {body: map[string]any{"total_count": 2, "workflow_runs": []map[string]any{{"id": 2}}}},
+	}
+	client := newGitHubClient("https://api.github.com", "tok", 1, false)
+	client.httpClient = &http.Client{Transport: fakeTransport{responses: responses}}
+	client.sleep = func(time.Duration) {}
+
+	landscape, selected, _, err := buildEstimateRepositoryLandscape(
+		client,
+		[]string{"o/quiet", "o/busy"},
+		map[string]repositoryInfo{
+			repoInfoKey("o/busy"):  {FullName: "o/busy", Size: 10},
+			repoInfoKey("o/quiet"): {FullName: "o/quiet", Size: 1000},
+		},
+		collectOptions{Since: "2025-05-01"},
+		config{},
+		io.Discard,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(selected, ",") != "o/busy,o/quiet" {
+		t.Fatalf("selected = %v, want all repos in ranked order", selected)
+	}
+	if !landscape.Repositories[0].Selected || !landscape.Repositories[1].Selected || landscape.SelectedRepos != 2 {
+		t.Fatalf("landscape selection = %#v", landscape)
+	}
+}
+
+func TestEstimateRepositoryLandscapeUsesMetadataWhenActivityProbeStops(t *testing.T) {
+	client := newGitHubClient("https://api.github.com", "tok", 1, false)
+	client.enableRequestBudget(1, 0)
+	defer client.disableRequestBudget()
+	client.httpClient = &http.Client{Transport: fakeTransport{responses: map[string]fakeResponse{
+		"/repos/o/large/actions/runs": {body: map[string]any{"total_count": 0, "workflow_runs": []map[string]any{}}},
+	}}}
+	client.sleep = func(time.Duration) {}
+
+	landscape, selected, warnings, err := buildEstimateRepositoryLandscape(
+		client,
+		[]string{"o/small", "o/large"},
+		map[string]repositoryInfo{
+			repoInfoKey("o/large"): {FullName: "o/large", Size: 1000000, PushedAt: "2025-05-01T12:00:00Z"},
+			repoInfoKey("o/small"): {FullName: "o/small", Size: 1, PushedAt: "2025-05-01T12:00:00Z"},
+		},
+		collectOptions{Since: "2025-05-01"},
+		config{},
+		io.Discard,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if landscape.ProbeComplete || landscape.StopReason == "" {
+		t.Fatalf("landscape probe state = complete %v stop %q, want partial with stop reason", landscape.ProbeComplete, landscape.StopReason)
+	}
+	if len(warnings) == 0 || !strings.Contains(strings.Join(warnings, "\n"), "landscape probing stopped") {
+		t.Fatalf("warnings = %v, want partial landscape warning", warnings)
+	}
+	if strings.Join(selected, ",") != "o/large,o/small" {
+		t.Fatalf("selected = %v, want metadata-ranked repos", selected)
+	}
+}
+
+func TestEstimateRepositoryLandscapeCapsProbesToPreserveEstimateBudget(t *testing.T) {
+	calls := 0
+	client := newGitHubClient("https://api.github.com", "tok", 1, false)
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		return fakeHTTPResponse(http.StatusOK, "200 OK", `{"total_count":99,"workflow_runs":[]}`, nil), nil
+	})}
+	client.sleep = func(time.Duration) {}
+
+	landscape, selected, warnings, err := buildEstimateRepositoryLandscape(
+		client,
+		[]string{"o/small", "o/large"},
+		map[string]repositoryInfo{
+			repoInfoKey("o/large"): {FullName: "o/large", Size: 1000000},
+			repoInfoKey("o/small"): {FullName: "o/small", Size: 1},
+		},
+		collectOptions{Since: "2025-05-01"},
+		config{estimateMaxRequests: 2, estimateSampleRuns: 1},
+		io.Discard,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Fatalf("landscape made %d API calls, want none when preserving a tiny estimate budget", calls)
+	}
+	if landscape.ProbeComplete || !strings.Contains(landscape.StopReason, "preserve estimate request budget") {
+		t.Fatalf("landscape probe state = complete %v stop %q", landscape.ProbeComplete, landscape.StopReason)
+	}
+	if len(warnings) == 0 || !strings.Contains(strings.Join(warnings, "\n"), "landscape probing stopped") {
+		t.Fatalf("warnings = %v, want partial landscape warning", warnings)
+	}
+	if strings.Join(selected, ",") != "o/large,o/small" {
+		t.Fatalf("selected = %v, want metadata-ranked repos", selected)
+	}
+}
+
 func TestSelectSampleRunsDeterministic(t *testing.T) {
 	var runs []workflowRun
 	for i := 0; i < 10; i++ {
@@ -1146,6 +1332,7 @@ func TestPrintTextEstimateModeIsProminent(t *testing.T) {
 			APIWorkers:      4,
 			RunStatus:       "completed",
 			JobFilter:       "all",
+			Top:             10,
 			Mode:            "estimate",
 		},
 		Scan:                  scanSummary{RepositoriesQueued: 1, RepositoriesScanned: 1, WorkflowRuns: 10, WorkflowJobs: 5, JobsUsed: 5, APIRequests: 7},
@@ -1167,12 +1354,28 @@ func TestPrintTextEstimateModeIsProminent(t *testing.T) {
 					"p99": {Median: 4, Lower: 2, Upper: 8},
 				},
 			},
+			RepositoryLandscape: &estimateRepositoryLandscape{
+				Strategy:      "actions_runs_then_metadata",
+				RankedRepos:   1,
+				SelectedRepos: 1,
+				ProbeComplete: true,
+				Repositories: []estimateRepositorySignal{{
+					Rank:                  1,
+					Repo:                  "o/r",
+					WorkflowRunCount:      10,
+					WorkflowRunCountKnown: true,
+					Size:                  123,
+					PushedAt:              "2025-05-01T12:00:00Z",
+					Selected:              true,
+					SelectionReason:       "selected; no repository limit",
+				}},
+			},
 		},
 	}
 	var out bytes.Buffer
 	printText(&out, rep)
 	text := out.String()
-	for _, want := range []string{"ESTIMATE MODE", "sampled 3 of 10", "Peak concurrency:     median 4 (90% range 2-8)", "not billing-grade exact"} {
+	for _, want := range []string{"ESTIMATE MODE", "sampled 3 of 10", "Repository landscape", "#1 o/r", "Peak concurrency:     median 4 (90% range 2-8)", "not billing-grade exact"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("output missing %q:\n%s", want, text)
 		}
@@ -1230,7 +1433,7 @@ func TestRunEstimateBuildsReportFromFakeAPI(t *testing.T) {
 		estimateIterations:   20,
 		estimateConfidence:   90,
 		estimateSeed:         123,
-	}, nil, time.Now(), io.Discard)
+	}, nil, nil, time.Now(), io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1242,6 +1445,9 @@ func TestRunEstimateBuildsReportFromFakeAPI(t *testing.T) {
 	}
 	if rep.Estimate.Metrics.PeakConcurrency.Median != 2 {
 		t.Fatalf("peak median = %v, want 2", rep.Estimate.Metrics.PeakConcurrency.Median)
+	}
+	if rep.Estimate.RepositoryLandscape == nil || rep.Estimate.RepositoryLandscape.SelectedRepos != 1 {
+		t.Fatalf("repository landscape = %#v", rep.Estimate.RepositoryLandscape)
 	}
 }
 
@@ -1626,6 +1832,7 @@ func TestValidateConfigRejectsCircleCIProviderWithEstimateFlags(t *testing.T) {
 		{name: "iterations", args: []string{"--estimate-iterations", "10"}, want: "--estimate-iterations"},
 		{name: "confidence", args: []string{"--estimate-confidence", "80"}, want: "--estimate-confidence"},
 		{name: "seed", args: []string{"--estimate-seed", "42"}, want: "--estimate-seed"},
+		{name: "repo limit", args: []string{"--estimate-repo-limit", "50"}, want: "--estimate-repo-limit"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
