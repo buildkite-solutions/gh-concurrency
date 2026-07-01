@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"math/rand"
 	"net/url"
 	"sort"
 	"strconv"
@@ -651,7 +650,7 @@ func selectSampleRuns(runs []workflowRun, target int, seed int64) []workflowRun 
 		groups[runStratumKey(run)] = append(groups[runStratumKey(run)], run)
 	}
 	keys := sortedStringKeys(groups)
-	rng := rand.New(rand.NewSource(seed))
+	rng := newDeterministicRand(seed)
 	var sample []workflowRun
 	var largeKeys []string
 	for _, key := range keys {
@@ -690,7 +689,7 @@ func selectSampleRuns(runs []workflowRun, target int, seed int64) []workflowRun 
 	return sample
 }
 
-func shuffleWorkflowRuns(runs []workflowRun, rng *rand.Rand) {
+func shuffleWorkflowRuns(runs []workflowRun, rng *deterministicRand) {
 	rng.Shuffle(len(runs), func(i, j int) {
 		runs[i], runs[j] = runs[j], runs[i]
 	})
@@ -764,7 +763,7 @@ func simulateEstimate(runs []workflowRun, sampled []sampledRun, cfg config) (est
 		return emptyEstimateMetrics(), []string{"No sampled workflow runs had usable completed jobs."}
 	}
 	for i := 0; i < iterations; i++ {
-		rng := rand.New(rand.NewSource(cfg.estimateSeed + int64(i+1)))
+		rng := newDeterministicRand(cfg.estimateSeed + int64(i+1))
 		records := append([]record{}, fixedRecords...)
 		for _, run := range unsampled {
 			anchor := runAnchor(run)
@@ -807,7 +806,7 @@ func buildRunShape(run workflowRun, records []record) runShape {
 	return shape
 }
 
-func drawRunShape(run workflowRun, byKey, byFallback map[string][]runShape, global []runShape, rng *rand.Rand) runShape {
+func drawRunShape(run workflowRun, byKey, byFallback map[string][]runShape, global []runShape, rng *deterministicRand) runShape {
 	if shapes := byKey[runStratumKey(run)]; len(shapes) > 0 {
 		return shapes[rng.Intn(len(shapes))]
 	}

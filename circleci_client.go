@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -299,7 +298,7 @@ func (c *circleCIClient) httpError(resp *http.Response, body []byte) error {
 
 func (c *circleCIClient) backoff(attempt int) {
 	base := time.Duration(1<<uint(min(attempt, 6))) * time.Second
-	jitter := time.Duration(rand.Intn(1000)) * time.Millisecond
+	jitter := time.Duration(cryptoIntn(1000)) * time.Millisecond
 	delay := base + jitter
 	c.logf("CircleCI backing off %.1fs (attempt %d)", delay.Seconds(), attempt+1)
 	c.sleep(delay)

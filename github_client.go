@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -426,7 +425,7 @@ func (c *githubClient) httpError(resp *http.Response, body []byte) error {
 
 func (c *githubClient) backoff(attempt int) {
 	base := time.Duration(1<<uint(min(attempt, 6))) * time.Second
-	jitter := time.Duration(rand.Intn(1000)) * time.Millisecond
+	jitter := time.Duration(cryptoIntn(1000)) * time.Millisecond
 	delay := base + jitter
 	c.logf("backing off %.1fs (attempt %d)", delay.Seconds(), attempt+1)
 	c.sleep(delay)
@@ -434,7 +433,7 @@ func (c *githubClient) backoff(attempt int) {
 
 func (c *githubClient) secondaryBackoff(attempt int) {
 	base := time.Duration(1<<uint(min(attempt, 5))) * time.Minute
-	jitter := time.Duration(rand.Intn(5000)) * time.Millisecond
+	jitter := time.Duration(cryptoIntn(5000)) * time.Millisecond
 	delay := base + jitter
 	c.logf("secondary rate limit: backing off %.0fs (attempt %d)", delay.Seconds(), attempt+1)
 	c.pauseRequests(delay, "secondary rate limit")
