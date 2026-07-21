@@ -29,7 +29,9 @@ type workflowJob struct {
 	CompletedAt     string   `json:"completed_at"`
 	CreatedAt       string   `json:"created_at"`
 	Labels          []string `json:"labels"`
+	RunnerID        int64    `json:"runner_id"`
 	RunnerName      string   `json:"runner_name"`
+	RunnerGroupID   int64    `json:"runner_group_id"`
 	RunnerGroupName string   `json:"runner_group_name"`
 }
 
@@ -45,8 +47,22 @@ type record struct {
 	OS              string
 	SelfHosted      bool
 	Labels          []string
+	RunnerID        int64
 	RunnerName      string
+	RunnerGroupID   int64
 	RunnerGroupName string
+	RepoVisibility  string
+	RunnerLabel     string
+	RunnerType      string
+	Platform        string
+	Architecture    string
+	RunnerImage     string
+	MachineSize     string
+	CPUCores        int
+	MemoryGB        int
+	StorageGB       int
+	SpecSource      string
+	SpecUpdatedAt   string
 	ResourceClass   string
 	Executor        string
 	Parallelism     int

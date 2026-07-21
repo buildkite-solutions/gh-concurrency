@@ -111,6 +111,55 @@ run job attempts (`--job-filter all`). Use `--include-in-progress` to include
 queued/running workflow runs in the scan, or `--job-filter latest` if you only
 want the latest attempt for each workflow run.
 
+### GitHub Runner Machine Types
+
+Exact GitHub scans group GitHub-hosted jobs by the exact workflow-job label by
+default, so `ubuntu-latest` and `ubuntu-24.04` are separate pools instead of
+both appearing as `GitHub-hosted/linux`. Known standard labels are enriched
+from GitHub's [documented runner table](https://docs.github.com/actions/reference/runners/github-hosted-runners)
+with vCPU, RAM, storage, platform, and architecture. The tool also separates
+public from private/internal repositories where GitHub assigns different
+standard hardware:
+
+```text
+GitHub-hosted/ubuntu-latest/public   [standard; 4 vCPU, 16 GB RAM; 14 GB SSD; x64]
+GitHub-hosted/ubuntu-latest/private  [standard; 2 vCPU, 8 GB RAM; 14 GB SSD; x64]
+```
+
+This default mode needs no permissions beyond the normal workflow and
+repository metadata access. Labels that are not in the standard-runner table
+still get their own exact pool, with hardware marked unknown. JSON output
+exposes the label, runner type, hardware fields, spec source, and standard-spec
+reference date on each `runner_pools` entry.
+
+For the highest fidelity on organization-level larger runners, add
+`--runner-inventory`:
+
+```bash
+gh concurrency \
+  --org owner \
+  --since 2025-05-01 \
+  --runner-inventory
+```
+
+This opt-in mode uses GitHub's [organization hosted-runner inventory endpoint](https://docs.github.com/rest/actions/hosted-runners#list-github-hosted-runners-for-an-organization)
+for each relevant organization and joins the job label to the configured
+runner name. Matching pools gain the machine-size ID, vCPU, RAM, storage,
+image, platform, and architecture. The extra endpoint requires fine-grained
+organization `Administration: read`
+permission (or the classic PAT scope documented by GitHub for the endpoint,
+`manage_runner:org`). If inventory cannot be read, the scan succeeds with the
+exact-label grouping and emits a warning instead of dropping data.
+
+Inventory is a snapshot of the current organization configuration, not a
+historical record. A runner that was resized, renamed, or removed after a job
+ran may therefore remain unmatched or reflect its current configuration.
+Standard enrichment also uses GitHub's current reference table, so a historical
+`-latest` alias may have represented different hardware when an old job ran.
+Enterprise-scoped larger runners require the separate enterprise inventory
+endpoint and `manage_runners:enterprise`; this flag currently uses only the
+organization endpoint, so those runners may remain hardware-unknown.
+
 ### CircleCI Projects
 
 CircleCI scans are project-scoped. Use a personal API token through
@@ -162,7 +211,7 @@ The CLI fails fast when a flag does not apply to the selected provider or mode.
 This includes explicit no-op defaults, such as `--job-filter all` with
 `--provider circleci` or `--circleci-vcs gh` with GitHub. Estimate tuning flags
 such as `--estimate-sample-runs` require `--estimate`, and estimate mode is
-GitHub-only.
+GitHub-only. `--runner-inventory` is GitHub exact-mode only.
 
 `--branch` is shared by GitHub and CircleCI. `--include-in-progress` is
 GitHub-only because CircleCI concurrency is measured from jobs with both
@@ -278,6 +327,12 @@ For organization-wide scans, the token must be able to list the organization's
 repositories and read Actions metadata for each repository you want included.
 Repositories that are not found or not readable are skipped with a warning.
 
+The optional `--runner-inventory` mode additionally requires fine-grained
+organization `Administration: read` permission. GitHub documents
+`manage_runner:org` for classic personal access tokens on the list
+GitHub-hosted runners endpoint. Keep this broader permission off the default
+scan token when larger-runner hardware details are not needed.
+
 For CircleCI scans, use a CircleCI personal API token. API v2 project tokens are
 not supported by CircleCI; set `CIRCLECI_TOKEN`, `CIRCLE_TOKEN`, or pass
 `--token`. The token must be able to read each CircleCI project you include.
@@ -297,7 +352,7 @@ Scan summary:
 
 Runner pools:
   self-hosted/blacksmith        peak   48  p95   30     4,120 jobs
-  GitHub-hosted/linux           peak   12  p95    8       930 jobs
+  GitHub-hosted/ubuntu-latest/private       peak   12  p95    8       930 jobs  [standard; 2 vCPU, 8 GB RAM; 14 GB SSD; x64]
   self-hosted/arc               peak    9  p95    6       310 jobs
 
 Top repositories by busy time:
@@ -311,9 +366,12 @@ Top repositories by busy time:
 - Size toward p95/p99, not the absolute peak. One nightly fan-out should not
   make you pay for that slot all month.
 - Runner pools are derived from GitHub's workflow-job metadata. GitHub-hosted
-  jobs are grouped by OS; self-hosted and third-party runner platforms such as
-  Blacksmith, RunsOn, or ARC are grouped by runner group when GitHub reports
-  one, with a label-based fallback for common third-party runner labels.
+  jobs are grouped by their exact label, with current standard-runner hardware
+  specs added automatically. The optional larger-runner inventory adds the
+  configured machine details where the token can read them. Self-hosted and
+  third-party runner platforms such as Blacksmith, RunsOn, or ARC are grouped
+  by runner group when GitHub reports one, with a label-based fallback for
+  common third-party runner labels.
 - CircleCI runner pools are grouped by resource class when per-job details are
   enabled. Jobs with `parallelism` greater than one are expanded into multiple
   concurrent slots for concurrency math.

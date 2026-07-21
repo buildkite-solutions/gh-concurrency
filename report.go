@@ -30,6 +30,7 @@ type parameters struct {
 	Branch               string   `json:"branch,omitempty"`
 	Event                string   `json:"event,omitempty"`
 	ExcludePullRequests  bool     `json:"exclude_pull_requests"`
+	RunnerInventory      bool     `json:"runner_inventory"`
 	Top                  int      `json:"top"`
 	Mode                 string   `json:"mode"`
 	EstimateMaxRequests  int      `json:"estimate_max_requests,omitempty"`
@@ -140,6 +141,7 @@ func buildParameters(cfg config) parameters {
 		Branch:              cfg.branch,
 		Event:               cfg.event,
 		ExcludePullRequests: cfg.excludePullRequests,
+		RunnerInventory:     cfg.runnerInventory,
 		Top:                 cfg.top,
 		Mode:                modeName(cfg),
 	}

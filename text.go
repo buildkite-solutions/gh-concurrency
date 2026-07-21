@@ -35,6 +35,9 @@ func printText(out io.Writer, rep report) {
 	if provider == githubProvider && p.IncludeArchived {
 		fmt.Fprintln(out, "archived repos: included")
 	}
+	if provider == githubProvider && p.RunnerInventory {
+		fmt.Fprintln(out, "runner inventory: enabled")
+	}
 	targetLabel := "repos"
 	countLabel := "repo count"
 	if provider == circleCIProvider {
@@ -72,13 +75,15 @@ func printText(out io.Writer, rep report) {
 	if len(rep.RunnerPools) > 0 {
 		fmt.Fprintln(out, "\nRunner pools:")
 		for _, pool := range rep.RunnerPools {
+			hardware := runnerPoolHardwareSummary(pool)
 			fmt.Fprintf(
 				out,
-				"  %-28s peak %4d  p95 %4d  %8s jobs\n",
+				"  %-42s peak %4d  p95 %4d  %8s jobs%s\n",
 				pool.Name,
 				pool.PeakConcurrency,
 				pool.PercentileConcurrency["p95"],
 				comma(pool.Jobs),
+				hardware,
 			)
 		}
 	}
@@ -109,6 +114,28 @@ func printText(out io.Writer, rep report) {
 	for _, warning := range rep.Warnings {
 		fmt.Fprintf(out, "\nWARNING: %s\n", warning)
 	}
+}
+
+func runnerPoolHardwareSummary(pool runnerPool) string {
+	if !pool.GitHubHosted {
+		return ""
+	}
+	var details []string
+	if pool.RunnerType != "" {
+		details = append(details, pool.RunnerType)
+	}
+	if pool.CPUCores > 0 && pool.MemoryGB > 0 {
+		details = append(details, fmt.Sprintf("%d vCPU, %d GB RAM", pool.CPUCores, pool.MemoryGB))
+		if pool.StorageGB > 0 {
+			details = append(details, fmt.Sprintf("%d GB SSD", pool.StorageGB))
+		}
+	} else {
+		details = append(details, "hardware unknown")
+	}
+	if pool.Architecture != "" && pool.Architecture != "unknown" {
+		details = append(details, pool.Architecture)
+	}
+	return "  [" + strings.Join(details, "; ") + "]"
 }
 
 func printEstimateText(out io.Writer, rep report) {

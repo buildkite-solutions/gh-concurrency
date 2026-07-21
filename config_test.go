@@ -35,6 +35,34 @@ func TestParseArgsIncludeArchived(t *testing.T) {
 	}
 }
 
+func TestParseArgsRunnerInventory(t *testing.T) {
+	cfg, err := parseArgs([]string{"--repo", "o/r", "--since", "2025-05-01", "--runner-inventory"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.runnerInventory {
+		t.Fatal("--runner-inventory did not enable larger-runner inventory")
+	}
+	if err := validateConfig(cfg); err != nil {
+		t.Fatalf("validateConfig: %v", err)
+	}
+}
+
+func TestValidateConfigRejectsRunnerInventoryOutsideGitHubExactMode(t *testing.T) {
+	for _, args := range [][]string{
+		{"--repo", "o/r", "--since", "2025-05-01", "--estimate", "--runner-inventory"},
+		{"--provider", "circleci", "--repo", "o/r", "--since", "2025-05-01", "--runner-inventory"},
+	} {
+		cfg, err := parseArgs(args, io.Discard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "--runner-inventory") {
+			t.Fatalf("validateConfig err = %v, want runner-inventory compatibility error", err)
+		}
+	}
+}
+
 func TestParseArgsPerformanceAndFilterFlags(t *testing.T) {
 	cfg, err := parseArgs([]string{
 		"--repo", "o/r",

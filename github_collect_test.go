@@ -24,7 +24,9 @@ func TestPaginationAndCollectionOfflineReplay(t *testing.T) {
 					"workflow_name":     "CI",
 					"conclusion":        "success",
 					"labels":            []string{"ubuntu-latest"},
+					"runner_id":         101,
 					"runner_name":       "GitHub Actions 1",
+					"runner_group_id":   1,
 					"runner_group_name": "GitHub Actions",
 				},
 			}},
@@ -72,6 +74,9 @@ func TestPaginationAndCollectionOfflineReplay(t *testing.T) {
 	if !oses["linux"] || !oses["windows"] {
 		t.Fatalf("OSes = %v, want linux and windows", oses)
 	}
+	if records[0].RunnerID != 101 || records[0].RunnerGroupID != 1 {
+		t.Fatalf("GitHub-hosted runner IDs = %d/%d, want 101/1", records[0].RunnerID, records[0].RunnerGroupID)
+	}
 	if records[1].RunnerName != "blacksmith-1" || records[1].RunnerGroupName != "blacksmith" || !records[1].SelfHosted {
 		t.Fatalf("runner metadata = %#v, want self-hosted blacksmith runner", records[1])
 	}
@@ -84,6 +89,12 @@ func TestPaginationAndCollectionOfflineReplay(t *testing.T) {
 	})
 	if peak != 2 {
 		t.Fatalf("peak = %d, want 2", peak)
+	}
+}
+
+func TestInferOSDoesNotDefaultUnknownLabelsToLinux(t *testing.T) {
+	if got := inferOS([]string{"high-memory"}); got != "unknown" {
+		t.Fatalf("inferOS = %q, want unknown", got)
 	}
 }
 

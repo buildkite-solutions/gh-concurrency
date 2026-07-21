@@ -147,18 +147,22 @@ func TestBillableMinutesSelfHostedIsFree(t *testing.T) {
 func TestRunnerPools(t *testing.T) {
 	records := []record{
 		{
-			Repo:       "o/api",
-			Start:      dt("10:00:00"),
-			End:        dt("10:10:00"),
-			OS:         "linux",
-			SelfHosted: false,
+			Repo:           "o/api",
+			Start:          dt("10:00:00"),
+			End:            dt("10:10:00"),
+			OS:             "linux",
+			SelfHosted:     false,
+			Labels:         []string{"ubuntu-latest"},
+			RepoVisibility: "private",
 		},
 		{
-			Repo:       "o/web",
-			Start:      dt("10:05:00"),
-			End:        dt("10:15:00"),
-			OS:         "linux",
-			SelfHosted: false,
+			Repo:           "o/web",
+			Start:          dt("10:05:00"),
+			End:            dt("10:15:00"),
+			OS:             "linux",
+			SelfHosted:     false,
+			Labels:         []string{"ubuntu-latest"},
+			RepoVisibility: "private",
 		},
 		{
 			Repo:            "o/api",
@@ -199,8 +203,11 @@ func TestRunnerPools(t *testing.T) {
 	if got[0].PercentileConcurrency["p95"] != 3 {
 		t.Fatalf("blacksmith p95 = %d, want 3", got[0].PercentileConcurrency["p95"])
 	}
-	if got[1].Name != "GitHub-hosted/linux" || got[1].PeakConcurrency != 2 || got[1].Jobs != 2 {
-		t.Fatalf("second pool = %#v, want GitHub-hosted/linux peak 2 jobs 2", got[1])
+	if got[1].Name != "GitHub-hosted/ubuntu-latest/private" || got[1].PeakConcurrency != 2 || got[1].Jobs != 2 {
+		t.Fatalf("second pool = %#v, want GitHub-hosted/ubuntu-latest/private peak 2 jobs 2", got[1])
+	}
+	if got[1].RunnerLabel != "ubuntu-latest" || got[1].RunnerType != "standard" || got[1].CPUCores != 2 || got[1].MemoryGB != 8 || got[1].Architecture != "x64" {
+		t.Fatalf("standard runner metadata = %#v, want private ubuntu standard 2 vCPU/8 GB x64", got[1])
 	}
 }
 
@@ -213,5 +220,55 @@ func TestClassifyRunnerPoolFallbacks(t *testing.T) {
 	unknownGitHubHosted := classifyRunnerPool(record{})
 	if unknownGitHubHosted.name != "GitHub-hosted/unknown" {
 		t.Fatalf("github-hosted fallback = %q, want GitHub-hosted/unknown", unknownGitHubHosted.name)
+	}
+}
+
+func TestRunnerPoolsSplitStandardLabelByRepositoryVisibility(t *testing.T) {
+	records := []record{
+		{Repo: "o/public", Start: dt("10:00:00"), End: dt("10:05:00"), Labels: []string{"ubuntu-latest"}, RepoVisibility: "public", RunnerGroupID: 1, RunnerGroupName: "GitHub Actions"},
+		{Repo: "o/private", Start: dt("10:00:00"), End: dt("10:05:00"), Labels: []string{"ubuntu-latest"}, RepoVisibility: "private", RunnerGroupID: 2, RunnerGroupName: "GitHub Actions"},
+	}
+
+	pools := runnerPools(records)
+	if len(pools) != 2 {
+		t.Fatalf("runnerPools returned %d pools, want visibility-specific pools: %#v", len(pools), pools)
+	}
+	byName := map[string]runnerPool{}
+	for _, pool := range pools {
+		byName[pool.Name] = pool
+	}
+	if got := byName["GitHub-hosted/ubuntu-latest/public"]; got.CPUCores != 4 || got.MemoryGB != 16 {
+		t.Fatalf("public standard spec = %#v, want 4 vCPU/16 GB", got)
+	}
+	if got := byName["GitHub-hosted/ubuntu-latest/private"]; got.CPUCores != 2 || got.MemoryGB != 8 {
+		t.Fatalf("private standard spec = %#v, want 2 vCPU/8 GB", got)
+	}
+}
+
+func TestRunnerPoolsDoNotSplitGitHubHostedLabelsByRunnerGroup(t *testing.T) {
+	records := []record{
+		{Repo: "one/r", Start: dt("10:00:00"), End: dt("10:05:00"), Labels: []string{"ubuntu-latest"}, RepoVisibility: "private", RunnerGroupID: 1, RunnerGroupName: "GitHub Actions"},
+		{Repo: "two/r", Start: dt("10:00:00"), End: dt("10:05:00"), Labels: []string{"ubuntu-latest"}, RepoVisibility: "private", RunnerGroupID: 99, RunnerGroupName: "Default"},
+	}
+
+	pools := runnerPools(records)
+	if len(pools) != 1 || pools[0].Jobs != 2 {
+		t.Fatalf("runnerPools = %#v, want one exact-label pool across organization-scoped runner groups", pools)
+	}
+}
+
+func TestRunnerPoolsGroupUnknownGitHubHostedByExactLabels(t *testing.T) {
+	records := []record{
+		{Start: dt("10:00:00"), End: dt("10:05:00"), Labels: []string{"acme-8-core"}},
+		{Start: dt("10:01:00"), End: dt("10:06:00"), Labels: []string{"acme-16-core"}},
+	}
+
+	pools := runnerPools(records)
+	if len(pools) != 2 {
+		t.Fatalf("runnerPools returned %d pools, want exact-label pools: %#v", len(pools), pools)
+	}
+	names := map[string]bool{pools[0].Name: true, pools[1].Name: true}
+	if !names["GitHub-hosted/acme-8-core"] || !names["GitHub-hosted/acme-16-core"] {
+		t.Fatalf("pool names = %v, want both exact labels", names)
 	}
 }

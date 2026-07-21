@@ -128,6 +128,18 @@ type runnerPool struct {
 	GitHubHosted          bool           `json:"github_hosted"`
 	SelfHosted            bool           `json:"self_hosted"`
 	OS                    string         `json:"os,omitempty"`
+	RunnerLabel           string         `json:"runner_label,omitempty"`
+	RunnerType            string         `json:"runner_type,omitempty"`
+	RepositoryVisibility  string         `json:"repository_visibility,omitempty"`
+	Platform              string         `json:"platform,omitempty"`
+	Architecture          string         `json:"architecture,omitempty"`
+	RunnerImage           string         `json:"runner_image,omitempty"`
+	MachineSize           string         `json:"machine_size,omitempty"`
+	CPUCores              int            `json:"cpu_cores,omitempty"`
+	MemoryGB              int            `json:"memory_gb,omitempty"`
+	StorageGB             int            `json:"storage_gb,omitempty"`
+	SpecSource            string         `json:"spec_source,omitempty"`
+	SpecUpdatedAt         string         `json:"spec_updated_at,omitempty"`
 	RunnerGroupName       string         `json:"runner_group_name,omitempty"`
 	ResourceClass         string         `json:"resource_class,omitempty"`
 	Executor              string         `json:"executor,omitempty"`
@@ -147,6 +159,18 @@ type runnerPoolKey struct {
 	gitHubHosted    bool
 	selfHosted      bool
 	osName          string
+	runnerLabel     string
+	runnerType      string
+	repoVisibility  string
+	platform        string
+	architecture    string
+	runnerImage     string
+	machineSize     string
+	cpuCores        int
+	memoryGB        int
+	storageGB       int
+	specSource      string
+	specUpdatedAt   string
 	runnerGroupName string
 	resourceClass   string
 	executor        string
@@ -182,6 +206,18 @@ func runnerPools(records []record) []runnerPool {
 			GitHubHosted:          key.gitHubHosted,
 			SelfHosted:            key.selfHosted,
 			OS:                    key.osName,
+			RunnerLabel:           key.runnerLabel,
+			RunnerType:            key.runnerType,
+			RepositoryVisibility:  key.repoVisibility,
+			Platform:              key.platform,
+			Architecture:          key.architecture,
+			RunnerImage:           key.runnerImage,
+			MachineSize:           key.machineSize,
+			CPUCores:              key.cpuCores,
+			MemoryGB:              key.memoryGB,
+			StorageGB:             key.storageGB,
+			SpecSource:            key.specSource,
+			SpecUpdatedAt:         key.specUpdatedAt,
 			RunnerGroupName:       key.runnerGroupName,
 			ResourceClass:         key.resourceClass,
 			Executor:              key.executor,
@@ -294,11 +330,46 @@ func classifyRunnerPool(rec record) runnerPoolKey {
 		}
 	}
 	if !rec.SelfHosted {
+		if rec.RunnerLabel == "" {
+			rec.RunnerLabel = githubHostedRunnerLabel(rec.Labels)
+		}
+		if rec.RunnerType == "" {
+			if specs, ok := githubStandardRunnerSpecs[strings.ToLower(rec.RunnerLabel)]; ok {
+				rec.RunnerType = "standard"
+				if spec, known := standardSpecForVisibility(specs, rec.RepoVisibility); known {
+					applyMachineSpec(&rec, spec)
+					rec.SpecSource = standardRunnerSpecSource
+					rec.SpecUpdatedAt = standardRunnerSpecUpdatedAt
+				}
+			} else {
+				rec.RunnerType = "github-hosted-unknown"
+			}
+		}
+		name := "GitHub-hosted/" + rec.RunnerLabel
+		poolVisibility := ""
+		if rec.RunnerType == "standard" {
+			name += "/" + nonEmpty(rec.RepoVisibility, "visibility-unknown")
+			poolVisibility = rec.RepoVisibility
+		} else if rec.RunnerType == "larger" && rec.MachineSize != "" {
+			name += "/" + rec.MachineSize
+		}
 		return runnerPoolKey{
-			provider:     githubProvider,
-			name:         "GitHub-hosted/" + osName,
-			gitHubHosted: true,
-			osName:       osName,
+			provider:       githubProvider,
+			name:           name,
+			gitHubHosted:   true,
+			osName:         nonEmpty(rec.OS, "unknown"),
+			runnerLabel:    rec.RunnerLabel,
+			runnerType:     rec.RunnerType,
+			repoVisibility: poolVisibility,
+			platform:       rec.Platform,
+			architecture:   rec.Architecture,
+			runnerImage:    rec.RunnerImage,
+			machineSize:    rec.MachineSize,
+			cpuCores:       rec.CPUCores,
+			memoryGB:       rec.MemoryGB,
+			storageGB:      rec.StorageGB,
+			specSource:     rec.SpecSource,
+			specUpdatedAt:  rec.SpecUpdatedAt,
 		}
 	}
 
@@ -315,6 +386,13 @@ func classifyRunnerPool(rec record) runnerPoolKey {
 		selfHosted:      true,
 		runnerGroupName: groupName,
 	}
+}
+
+func nonEmpty(value, fallback string) string {
+	if value = strings.TrimSpace(value); value != "" {
+		return value
+	}
+	return fallback
 }
 
 func runnerGroupPoolName(groupName string) string {

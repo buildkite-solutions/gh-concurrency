@@ -46,6 +46,7 @@ type config struct {
 	branch               string
 	event                string
 	excludePullRequests  bool
+	runnerInventory      bool
 	top                  int
 	estimate             bool
 	estimateMaxRequests  int
@@ -107,6 +108,7 @@ func parseArgs(argv []string, stderr io.Writer) (config, error) {
 	fs.StringVar(&cfg.branch, "branch", "", "only include runs for this branch")
 	fs.StringVar(&cfg.event, "event", "", "GitHub-only: only include workflow runs for this event, such as push or pull_request")
 	fs.BoolVar(&cfg.excludePullRequests, "exclude-pull-requests", false, "GitHub-only: omit pull request workflow runs")
+	fs.BoolVar(&cfg.runnerInventory, "runner-inventory", false, "GitHub exact-mode only: enrich larger runner pools from organization inventory (requires Administration: read)")
 	fs.IntVar(&cfg.top, "top", 10, "number of top repositories, workflows, and jobs to show")
 	fs.BoolVar(&cfg.estimate, "estimate", false, "GitHub-only: use sampled workflow-run jobs and simulation to estimate concurrency faster")
 	fs.IntVar(&cfg.estimateMaxRequests, "estimate-max-requests", 1000, "GitHub estimate-only: maximum API requests to spend after target resolution")
@@ -309,6 +311,8 @@ func validateFlagCompatibility(cfg config) error {
 		if err := rejectProvidedFlags(cfg, estimateKnobFlags(), "requires --estimate"); err != nil {
 			return err
 		}
+	} else if cfg.runnerInventory {
+		return errors.New("--runner-inventory requires exact mode; remove --estimate")
 	}
 	return nil
 }
@@ -332,6 +336,7 @@ func githubOnlyFlags() []string {
 		"job-filter",
 		"event",
 		"exclude-pull-requests",
+		"runner-inventory",
 	}
 }
 

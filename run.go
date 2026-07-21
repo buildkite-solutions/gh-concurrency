@@ -168,7 +168,13 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	var inventory hostedRunnerInventoryResult
+	if cfg.runnerInventory {
+		inventory = collectGitHubHostedRunnerInventory(client, records)
+	}
+	runnerWarnings := prepareGitHubRunnerMetadata(records, repoInfos, inventory)
 	rep := buildReport(records, cfg, time.Since(started), summary, client.statsSnapshot())
+	rep.Warnings = append(rep.Warnings, runnerWarnings...)
 	if cfg.format == "json" {
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
