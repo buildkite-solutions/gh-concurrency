@@ -98,7 +98,7 @@ func parseArgs(argv []string, stderr io.Writer) (config, error) {
 	fs.StringVar(&cfg.baseURL, "base-url", "", "API base URL. GitHub default: GITHUB_API_URL or https://api.github.com; CircleCI default: CIRCLECI_API_URL or https://circleci.com/api/v2")
 	fs.StringVar(&cfg.token, "token", "", "API token. GitHub defaults to GITHUB_TOKEN/GH_TOKEN plus gh auth fallback; CircleCI defaults to CIRCLECI_TOKEN/CIRCLE_TOKEN")
 	fs.StringVar(&cfg.format, "format", "text", "output format: text or json")
-	fs.IntVar(&cfg.maxRetries, "max-retries", 6, "maximum HTTP retry attempts")
+	fs.IntVar(&cfg.maxRetries, "max-retries", 6, "maximum HTTP attempts (including retries)")
 	fs.IntVar(&cfg.requestDelayMS, "request-delay-ms", 100, "minimum delay before each API request; helps avoid rate limits")
 	fs.IntVar(&cfg.apiWorkers, "api-workers", 4, "maximum concurrent API requests")
 	fs.BoolVar(&cfg.includeArchived, "include-archived", false, "GitHub-only: include archived repositories instead of skipping them during target resolution")
