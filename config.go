@@ -83,7 +83,7 @@ func parseArgs(argv []string, stderr io.Writer) (config, error) {
 	fs := flag.NewFlagSet("gh-concurrency", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.StringVar(&cfg.provider, "provider", defaultProvider, "CI provider: github or circleci")
-	fs.Var(&repos, "repo", "repository in OWNER/NAME form (GitHub) or mapped to VCS/OWNER/NAME (CircleCI; repeatable)")
+	fs.Var(&repos, "repo", "repository in OWNER/NAME form (GitHub) or OWNER/NAME for CircleCI (mapped to VCS/OWNER/NAME using --circleci-vcs; repeatable)")
 	fs.Var(&orgs, "org", "GitHub-only: organization whose accessible repositories should be pooled (repeatable)")
 	fs.Var(&repoFiles, "repo-file", "file containing OWNER/NAME repositories, one per line or comma/space separated (repeatable)")
 	fs.Var(&orgFiles, "org-file", "GitHub-only: file containing organization names, one per line or comma/space separated (repeatable)")
