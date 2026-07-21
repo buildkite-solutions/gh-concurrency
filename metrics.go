@@ -376,7 +376,7 @@ func computeQueueStats(records []record) *queueStats {
 	return &queueStats{
 		Count:   n,
 		MedianS: qs[n/2],
-		P95S:    qs[min(n-1, int(float64(n)*0.95))],
+		P95S:    qs[min(n-1, int(math.Ceil(float64(n)*0.95))-1)],
 		MaxS:    qs[n-1],
 	}
 }
