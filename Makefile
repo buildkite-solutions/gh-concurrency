@@ -12,7 +12,7 @@ BUILD_ARGS = --build-arg VERSION=$(VERSION) \
              --build-arg COMMIT=$(COMMIT) \
              --build-arg DATE=$(DATE)
 
-.PHONY: test fmt build run docker-build docker-publish release-binaries clean
+.PHONY: test fmt build run docker-build docker-build-only docker-publish release-binaries clean
 
 test:
 	$(GO) test ./...
@@ -26,7 +26,9 @@ build: test
 run: build
 	./$(BINARY) $(ARGS)
 
-docker-build: test
+docker-build: test docker-build-only
+
+docker-build-only:
 	docker build $(BUILD_ARGS) -t $(IMAGE):$(VERSION) -t $(IMAGE):latest .
 
 docker-publish: test

@@ -8,7 +8,7 @@ ARG DATE=unknown
 
 WORKDIR /src
 COPY go.mod ./
-COPY main.go ./
+COPY *.go ./
 
 RUN CGO_ENABLED=0 go build -trimpath \
     -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${DATE}" \
