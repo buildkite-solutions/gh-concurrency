@@ -113,8 +113,8 @@ func parseArgs(argv []string, stderr io.Writer) (config, error) {
 	fs.BoolVar(&cfg.excludePullRequests, "exclude-pull-requests", false, "GitHub-only: omit pull request workflow runs")
 	fs.BoolVar(&cfg.runnerInventory, "runner-inventory", false, "GitHub exact-mode only: enrich larger runner pools from organization inventory (requires Administration: read)")
 	fs.IntVar(&cfg.top, "top", 10, "number of top repositories, workflows, and jobs to show")
-	fs.StringVar(&cfg.resourceMapFile, "resource-map", "", "exact mode: JSON file mapping job metadata to target platform, shape, and vCPUs")
-	fs.IntVar(&cfg.defaultVCPUs, "default-vcpus", 0, "exact mode: target vCPUs for jobs not matched by --resource-map; 0 leaves them unresolved")
+	fs.StringVar(&cfg.resourceMapFile, "resource-map", "", "JSON file mapping job metadata to target platform, shape, and vCPUs")
+	fs.IntVar(&cfg.defaultVCPUs, "default-vcpus", 0, "target vCPUs for jobs not matched by --resource-map; 0 leaves them unresolved")
 	fs.BoolVar(&cfg.estimate, "estimate", false, "GitHub-only: use sampled workflow-run jobs and simulation to estimate concurrency faster")
 	fs.IntVar(&cfg.estimateMaxRequests, "estimate-max-requests", 1000, "GitHub estimate-only: maximum API requests to spend after target resolution")
 	fs.IntVar(&cfg.estimateMinRemaining, "estimate-min-remaining", 500, "GitHub estimate-only: stop before primary rate-limit remaining reaches this value")
@@ -321,14 +321,6 @@ func validateFlagCompatibility(cfg config) error {
 		}
 	} else if cfg.runnerInventory {
 		return errors.New("--runner-inventory requires exact mode; remove --estimate")
-	}
-	if cfg.estimate {
-		if flagProvided(cfg, "resource-map") {
-			return errors.New("--resource-map is not yet supported with --estimate; run exact mode")
-		}
-		if flagProvided(cfg, "default-vcpus") {
-			return errors.New("--default-vcpus is not yet supported with --estimate; run exact mode")
-		}
 	}
 	return nil
 }

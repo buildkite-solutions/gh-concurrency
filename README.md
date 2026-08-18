@@ -267,6 +267,10 @@ Total job runtime:    median 820400.00 job-min (90% range 710000.00-970000.00)
 Active window time:   median 720.00h (90% range 700.00-744.00h)
 Peak job concurrency: median 146 jobs (90% range 105-230)
 p95 job concurrency:   median 30 jobs (90% range 22-48)
+
+Buildkite vCPU projection (simulation intervals):
+  Coverage: median 11,900/12,340 mapped jobs; runtime 96.5% (90% range 93.0-98.0%)
+  Overall:                  vCPU-min 3125000.00 (90% range 2700000.00-3800000.00)  peak 320 (240-470)  p95 148 (115-205)
 ```
 
 Tune the request budget and reproducibility when needed:
@@ -279,6 +283,7 @@ gh concurrency \
   --estimate-max-requests 750 \
   --estimate-min-remaining 500 \
   --estimate-sample-runs 200 \
+  --resource-map buildkite-resources.json \
   --estimate-repo-limit 50 \
   --estimate-seed 12345
 ```
@@ -406,8 +411,8 @@ Top repositories by total job runtime:
 
 ### Project Buildkite vCPU Usage And Capacity
 
-Exact mode can map observed jobs to target Buildkite resources and calculate
-vCPU-weighted usage and capacity. Pass a JSON mapping file with
+Exact and estimated modes can map observed jobs to target Buildkite resources
+and calculate vCPU-weighted usage and capacity. Pass a JSON mapping file with
 `--resource-map`:
 
 ```json
@@ -432,6 +437,11 @@ vCPU-weighted usage and capacity. Pass a JSON mapping file with
       "name": "standard Linux",
       "match": {"labels": ["ubuntu-*"]},
       "target": {"platform": "linux", "shape": "small", "vcpus": 2}
+    },
+    {
+      "name": "CircleCI large",
+      "match": {"provider": "circleci", "resource_class": "large"},
+      "target": {"platform": "linux", "shape": "medium", "vcpus": 4}
     }
   ]
 }
@@ -450,7 +460,10 @@ case-insensitive shell globs. Supported fields are `provider`, `repo`,
 `labels`; every listed label pattern must match at least one job label. An
 omitted target platform inherits the job's observed OS. The tool does not
 silently guess target vCPUs from runner labels; encode known source-to-target
-decisions as rules.
+decisions as rules. The same format covers GitHub-hosted, self-hosted, and
+third-party runner labels as well as CircleCI resource classes. Provider
+catalogs are intentionally not hard-coded because custom and vendor resource
+classes change independently of this tool.
 
 Use `--default-vcpus N` to explicitly assign a fallback vCPU count to every
 unmatched job. Without a fallback, unmatched jobs remain unresolved. The output
@@ -459,19 +472,27 @@ groups, and does not silently extrapolate them. With partial coverage,
 vCPU-minutes and peak vCPU are mapped-workload minima; percentiles describe
 mapped-active time only and are not statistical bounds on the full workload.
 
-The projection reports actual-duration vCPU-minutes, peak and time-weighted
+Exact projections report actual-duration vCPU-minutes, peak and time-weighted
 p50/p90/p95/p99 vCPU demand, platform and target-shape breakdowns, and top
-repositories, workflows, and jobs by projected vCPU-minutes. It assumes job
-durations remain unchanged after migration; benchmark representative workloads
-before committing to target shapes. Capacity uses observed job execution
-intervals and does not add Buildkite agent boot or dispatch time. Resource maps
-are currently exact-mode only, so `--estimate` rejects `--resource-map` and
-`--default-vcpus` rather than returning unweighted simulation results.
+repositories, workflows, and jobs by projected vCPU-minutes. Estimate mode
+applies the same mapping rules to every simulated job shape and reports median
+and confidence intervals for mapping coverage, vCPU-minutes, peak and
+percentile vCPU demand, platforms, target groups, and assignment sources.
 
-JSON output adds `compute_projection`, including `coverage`, `overall`,
-`platforms`, `targets`, `assignment_sources`, unmapped groups, and vCPU-weighted
-top summaries. Existing job-concurrency and legacy `busy_hours` fields remain
-available for compatibility.
+Both modes assume job durations remain unchanged after migration; benchmark
+representative workloads before committing to target shapes. Capacity uses
+observed job execution intervals and does not add Buildkite agent boot or
+dispatch time. CircleCI parallel jobs are already expanded into concurrent
+execution slots, so a resource-class rule's vCPU value is applied once per
+parallel slot. Keep per-job details enabled so CircleCI resource classes and
+parallelism are available to the resolver.
+
+Exact JSON output adds top-level `compute_projection`, including `coverage`,
+`overall`, `platforms`, `targets`, `assignment_sources`, unmapped groups, and
+vCPU-weighted top summaries. Estimated JSON adds
+`estimate.compute_projection`, whose numeric metrics are simulation intervals.
+Existing job-concurrency and legacy `busy_hours` fields remain available for
+compatibility.
 
 Use `--format json` for machine-readable output. Progress and diagnostics are
 written to stderr so they do not corrupt JSON:

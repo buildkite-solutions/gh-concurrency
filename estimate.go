@@ -28,6 +28,36 @@ type estimateMetrics struct {
 	PercentileConcurrency map[string]estimateInterval `json:"percentile_concurrency"`
 }
 
+type estimateResourceCoverage struct {
+	TotalJobs            estimateInterval `json:"total_jobs"`
+	MappedJobs           estimateInterval `json:"mapped_jobs"`
+	UnmappedJobs         estimateInterval `json:"unmapped_jobs"`
+	JobPercent           estimateInterval `json:"job_percent"`
+	TotalRuntimeMinutes  estimateInterval `json:"total_runtime_minutes"`
+	MappedRuntimeMinutes estimateInterval `json:"mapped_runtime_minutes"`
+	RuntimePercent       estimateInterval `json:"runtime_percent"`
+}
+
+type estimateComputeDemand struct {
+	Platform          string                      `json:"platform,omitempty"`
+	Shape             string                      `json:"shape,omitempty"`
+	VCPUsPerJob       int                         `json:"vcpus_per_job,omitempty"`
+	Jobs              estimateInterval            `json:"jobs"`
+	JobRuntimeMinutes estimateInterval            `json:"job_runtime_minutes"`
+	VCPUMinutes       estimateInterval            `json:"vcpu_minutes"`
+	PeakVCPUs         estimateInterval            `json:"peak_vcpus"`
+	PercentileVCPUs   map[string]estimateInterval `json:"percentile_vcpus"`
+}
+
+type estimateComputeProjection struct {
+	Model             string                      `json:"model"`
+	Coverage          estimateResourceCoverage    `json:"coverage"`
+	AssignmentSources map[string]estimateInterval `json:"assignment_sources"`
+	Overall           estimateComputeDemand       `json:"overall"`
+	Platforms         []estimateComputeDemand     `json:"platforms"`
+	Targets           []estimateComputeDemand     `json:"targets"`
+}
+
 type estimateRepositoryLandscape struct {
 	Strategy      string                     `json:"strategy"`
 	RepoLimit     int                        `json:"repo_limit"`
@@ -74,6 +104,7 @@ type estimateReport struct {
 	StopReason          string                       `json:"stop_reason,omitempty"`
 	Warnings            []string                     `json:"warnings,omitempty"`
 	Metrics             estimateMetrics              `json:"metrics"`
+	ComputeProjection   *estimateComputeProjection   `json:"compute_projection,omitempty"`
 	RepositoryLandscape *estimateRepositoryLandscape `json:"repository_landscape,omitempty"`
 }
 
@@ -119,6 +150,7 @@ type simulationMetric struct {
 	P90               int
 	P95               int
 	P99               int
+	Compute           *computeProjection
 }
 
 func buildEstimateRepositoryLandscape(client *githubClient, repos []string, repoInfos map[string]repositoryInfo, opts collectOptions, cfg config, stderr io.Writer) (*estimateRepositoryLandscape, []string, []string, error) {
@@ -440,7 +472,7 @@ func runEstimate(client *githubClient, cfg config, repoInfos map[string]reposito
 		return report{}, errors.New("not enough sampled workflow runs for estimate before API budget/rate-limit stop")
 	}
 
-	metrics, warnings := simulateEstimate(runs, sampled, cfg)
+	metrics, compute, warnings := simulateEstimate(runs, sampled, cfg)
 	warnings = append(landscapeWarnings, warnings...)
 	if stopReason == "" {
 		stopReason = client.requestBudgetStopReason()
@@ -452,7 +484,16 @@ func runEstimate(client *githubClient, cfg config, repoInfos map[string]reposito
 		warnings = append(warnings, "workflow-run census stopped before all target repositories/pages were read")
 	}
 	warnings = append(warnings, "Peak job concurrency is sensitive to rare unsampled fan-out; run exact mode before final commitments.")
-	warnings = append(warnings, "Concurrency metrics count running job slots, not vCPUs. Map runner sizes before using them to estimate Buildkite Hosted Agent vCPU capacity or usage.")
+	if compute == nil {
+		warnings = append(warnings, "Concurrency metrics count running job slots, not vCPUs. Use --resource-map or --default-vcpus to add a Buildkite Hosted Agent vCPU simulation.")
+	} else {
+		warnings = append(warnings, "The vCPU simulation assumes job durations remain unchanged on the target Buildkite agents; validate target shapes with representative workloads.")
+		warnings = append(warnings, "The vCPU capacity simulation uses observed job execution intervals and does not include Buildkite agent boot or dispatch time.")
+		if compute.Coverage.UnmappedJobs.Upper > 0 {
+			warnings = append(warnings, fmt.Sprintf("Median simulated resource-map coverage is %.1f%% of job runtime (%.1f-%.1f%% interval). vCPU-minutes and peak are mapped-workload minima; percentiles describe mapped-active time only.",
+				compute.Coverage.RuntimePercent.Median, compute.Coverage.RuntimePercent.Lower, compute.Coverage.RuntimePercent.Upper))
+		}
+	}
 
 	stats := client.statsSnapshot()
 	runtimeS := runtimeSeconds(time.Since(started))
@@ -487,6 +528,7 @@ func runEstimate(client *githubClient, cfg config, repoInfos map[string]reposito
 		StopReason:          stopReason,
 		Warnings:            warnings,
 		Metrics:             metrics,
+		ComputeProjection:   compute,
 		RepositoryLandscape: landscape,
 	}
 
@@ -736,7 +778,7 @@ func collectSampledRunJobs(client *githubClient, runs []workflowRun, opts collec
 	return sampled, summary, stopReason, nil
 }
 
-func simulateEstimate(runs []workflowRun, sampled []sampledRun, cfg config) (estimateMetrics, []string) {
+func simulateEstimate(runs []workflowRun, sampled []sampledRun, cfg config) (estimateMetrics, *estimateComputeProjection, []string) {
 	sampledIDs := map[int64]bool{}
 	var fixedRecords []record
 	var shapes []runShape
@@ -766,7 +808,7 @@ func simulateEstimate(runs []workflowRun, sampled []sampledRun, cfg config) (est
 	warnings := []string{}
 	globalShapes := shapes
 	if len(globalShapes) == 0 {
-		return emptyEstimateMetrics(), []string{"No sampled workflow runs had usable completed jobs."}
+		return emptyEstimateMetrics(), nil, []string{"No sampled workflow runs had usable completed jobs."}
 	}
 	for i := 0; i < iterations; i++ {
 		rng := newDeterministicRand(cfg.estimateSeed + int64(i+1))
@@ -779,9 +821,9 @@ func simulateEstimate(runs []workflowRun, sampled []sampledRun, cfg config) (est
 			shape := drawRunShape(run, byKey, byFallback, globalShapes, rng)
 			records = append(records, applyRunShape(run, anchor, shape)...)
 		}
-		values = append(values, metricForRecords(records))
+		values = append(values, metricForRecords(records, cfg))
 	}
-	return intervalsForMetrics(values, cfg.estimateConfidence), warnings
+	return intervalsForMetrics(values, cfg.estimateConfidence), estimateComputeProjectionFromValues(values, cfg.estimateConfidence), warnings
 }
 
 func buildRunShape(run workflowRun, records []record) runShape {
@@ -851,7 +893,7 @@ func applyRunShape(run workflowRun, anchor time.Time, shape runShape) []record {
 	return records
 }
 
-func metricForRecords(records []record) simulationMetric {
+func metricForRecords(records []record, cfg config) simulationMetric {
 	intervals := make([][2]time.Time, 0, len(records))
 	for _, rec := range records {
 		intervals = append(intervals, [2]time.Time{rec.Start, rec.End})
@@ -871,6 +913,7 @@ func metricForRecords(records []record) simulationMetric {
 		P90:               pct[90],
 		P95:               pct[95],
 		P99:               pct[99],
+		Compute:           buildComputeProjectionWithDetails(records, cfg, false),
 	}
 }
 
@@ -889,6 +932,152 @@ func intervalsForMetrics(values []simulationMetric, confidence int) estimateMetr
 			"p90": intervalFromValues(values, confidence, func(v simulationMetric) float64 { return float64(v.P90) }),
 			"p95": intervalFromValues(values, confidence, func(v simulationMetric) float64 { return float64(v.P95) }),
 			"p99": intervalFromValues(values, confidence, func(v simulationMetric) float64 { return float64(v.P99) }),
+		},
+	}
+}
+
+func estimateComputeProjectionFromValues(values []simulationMetric, confidence int) *estimateComputeProjection {
+	configured := false
+	platformSet := map[string]bool{}
+	targetSet := map[targetResourceKey]bool{}
+	sourceSet := map[string]bool{}
+	for _, value := range values {
+		if value.Compute == nil {
+			continue
+		}
+		configured = true
+		for _, demand := range value.Compute.Platforms {
+			platformSet[demand.Platform] = true
+		}
+		for _, demand := range value.Compute.Targets {
+			targetSet[targetResourceKey{platform: demand.Platform, shape: demand.Shape, vcpus: demand.VCPUsPerJob}] = true
+		}
+		for source := range value.Compute.AssignmentSources {
+			sourceSet[source] = true
+		}
+	}
+	if !configured {
+		return nil
+	}
+
+	coverageValue := func(value simulationMetric) resourceCoverage {
+		if value.Compute == nil {
+			return resourceCoverage{}
+		}
+		return value.Compute.Coverage
+	}
+	coverage := estimateResourceCoverage{
+		TotalJobs:            intervalFromValues(values, confidence, func(value simulationMetric) float64 { return float64(coverageValue(value).TotalJobs) }),
+		MappedJobs:           intervalFromValues(values, confidence, func(value simulationMetric) float64 { return float64(coverageValue(value).MappedJobs) }),
+		UnmappedJobs:         intervalFromValues(values, confidence, func(value simulationMetric) float64 { return float64(coverageValue(value).UnmappedJobs) }),
+		JobPercent:           intervalFromValues(values, confidence, func(value simulationMetric) float64 { return coverageValue(value).JobPercent }),
+		TotalRuntimeMinutes:  intervalFromValues(values, confidence, func(value simulationMetric) float64 { return coverageValue(value).TotalRuntimeMinutes }),
+		MappedRuntimeMinutes: intervalFromValues(values, confidence, func(value simulationMetric) float64 { return coverageValue(value).MappedRuntimeMinutes }),
+		RuntimePercent:       intervalFromValues(values, confidence, func(value simulationMetric) float64 { return coverageValue(value).RuntimePercent }),
+	}
+
+	platformNames := make([]string, 0, len(platformSet))
+	for platform := range platformSet {
+		platformNames = append(platformNames, platform)
+	}
+	sort.Strings(platformNames)
+	platforms := make([]estimateComputeDemand, 0, len(platformNames))
+	for _, platform := range platformNames {
+		platform := platform
+		platforms = append(platforms, estimateComputeDemandFromValues(values, confidence, platform, "", 0, func(projection *computeProjection) (computeDemand, bool) {
+			for _, demand := range projection.Platforms {
+				if demand.Platform == platform {
+					return demand, true
+				}
+			}
+			return computeDemand{}, false
+		}))
+	}
+
+	targetKeys := make([]targetResourceKey, 0, len(targetSet))
+	for key := range targetSet {
+		targetKeys = append(targetKeys, key)
+	}
+	sort.Slice(targetKeys, func(i, j int) bool {
+		if targetKeys[i].platform != targetKeys[j].platform {
+			return targetKeys[i].platform < targetKeys[j].platform
+		}
+		if targetKeys[i].vcpus != targetKeys[j].vcpus {
+			return targetKeys[i].vcpus < targetKeys[j].vcpus
+		}
+		return targetKeys[i].shape < targetKeys[j].shape
+	})
+	targets := make([]estimateComputeDemand, 0, len(targetKeys))
+	for _, key := range targetKeys {
+		key := key
+		targets = append(targets, estimateComputeDemandFromValues(values, confidence, key.platform, key.shape, key.vcpus, func(projection *computeProjection) (computeDemand, bool) {
+			for _, demand := range projection.Targets {
+				if demand.Platform == key.platform && demand.Shape == key.shape && demand.VCPUsPerJob == key.vcpus {
+					return demand, true
+				}
+			}
+			return computeDemand{}, false
+		}))
+	}
+
+	sourceNames := make([]string, 0, len(sourceSet))
+	for source := range sourceSet {
+		sourceNames = append(sourceNames, source)
+	}
+	sort.Strings(sourceNames)
+	sources := make(map[string]estimateInterval, len(sourceNames))
+	for _, source := range sourceNames {
+		source := source
+		sources[source] = intervalFromValues(values, confidence, func(value simulationMetric) float64 {
+			if value.Compute == nil {
+				return 0
+			}
+			return float64(value.Compute.AssignmentSources[source])
+		})
+	}
+
+	return &estimateComputeProjection{
+		Model:             "target_vcpu",
+		Coverage:          coverage,
+		AssignmentSources: sources,
+		Overall: estimateComputeDemandFromValues(values, confidence, "", "", 0, func(projection *computeProjection) (computeDemand, bool) {
+			return projection.Overall, true
+		}),
+		Platforms: platforms,
+		Targets:   targets,
+	}
+}
+
+func estimateComputeDemandFromValues(
+	values []simulationMetric,
+	confidence int,
+	platform, shape string,
+	vcpusPerJob int,
+	demandFor func(*computeProjection) (computeDemand, bool),
+) estimateComputeDemand {
+	valueFor := func(value simulationMetric) computeDemand {
+		if value.Compute == nil {
+			return computeDemand{}
+		}
+		demand, ok := demandFor(value.Compute)
+		if !ok {
+			return computeDemand{}
+		}
+		return demand
+	}
+	return estimateComputeDemand{
+		Platform:          platform,
+		Shape:             shape,
+		VCPUsPerJob:       vcpusPerJob,
+		Jobs:              intervalFromValues(values, confidence, func(value simulationMetric) float64 { return float64(valueFor(value).Jobs) }),
+		JobRuntimeMinutes: intervalFromValues(values, confidence, func(value simulationMetric) float64 { return valueFor(value).JobRuntimeMinutes }),
+		VCPUMinutes:       intervalFromValues(values, confidence, func(value simulationMetric) float64 { return valueFor(value).VCPUMinutes }),
+		PeakVCPUs:         intervalFromValues(values, confidence, func(value simulationMetric) float64 { return float64(valueFor(value).PeakVCPUs) }),
+		PercentileVCPUs: map[string]estimateInterval{
+			"p50": intervalFromValues(values, confidence, func(value simulationMetric) float64 { return float64(valueFor(value).PercentileVCPUs["p50"]) }),
+			"p90": intervalFromValues(values, confidence, func(value simulationMetric) float64 { return float64(valueFor(value).PercentileVCPUs["p90"]) }),
+			"p95": intervalFromValues(values, confidence, func(value simulationMetric) float64 { return float64(valueFor(value).PercentileVCPUs["p95"]) }),
+			"p99": intervalFromValues(values, confidence, func(value simulationMetric) float64 { return float64(valueFor(value).PercentileVCPUs["p99"]) }),
 		},
 	}
 }

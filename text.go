@@ -238,12 +238,59 @@ func printEstimateText(out io.Writer, rep report) {
 			formatEstimateNumber(interval.Lower),
 			formatEstimateNumber(interval.Upper))
 	}
+	printEstimateComputeProjection(out, est.ComputeProjection, est.Confidence)
 	printScanSummaryForProvider(out, rep.Scan, rep.Parameters.Provider)
 	fmt.Fprintln(out, "\nEstimate notes:")
 	fmt.Fprintln(out, "  These are sampled simulation intervals, not billing-grade exact measurements.")
 	for _, warning := range est.Warnings {
 		fmt.Fprintf(out, "  WARNING: %s\n", warning)
 	}
+}
+
+func printEstimateComputeProjection(out io.Writer, projection *estimateComputeProjection, confidence int) {
+	if projection == nil {
+		return
+	}
+	coverage := projection.Coverage
+	fmt.Fprintln(out, "\nBuildkite vCPU projection (simulation intervals):")
+	fmt.Fprintf(out, "  Coverage: median %s/%s mapped jobs; runtime %.1f%% (%d%% range %.1f-%.1f%%)\n",
+		formatEstimateNumber(coverage.MappedJobs.Median), formatEstimateNumber(coverage.TotalJobs.Median),
+		coverage.RuntimePercent.Median, confidence, coverage.RuntimePercent.Lower, coverage.RuntimePercent.Upper)
+	printEstimateComputeDemand(out, "Overall", projection.Overall, confidence)
+	if len(projection.Platforms) > 0 {
+		fmt.Fprintln(out, "  Platforms:")
+		for _, demand := range projection.Platforms {
+			printEstimateComputeDemand(out, "    "+demand.Platform, demand, confidence)
+		}
+	}
+	if len(projection.Targets) > 0 {
+		fmt.Fprintln(out, "  Target groups:")
+		for _, demand := range projection.Targets {
+			name := demand.Platform
+			if demand.Shape != "" {
+				name += "/" + demand.Shape
+			}
+			name += fmt.Sprintf(" (%d vCPU/job)", demand.VCPUsPerJob)
+			printEstimateComputeDemand(out, "    "+name, demand, confidence)
+		}
+	}
+	if len(projection.AssignmentSources) > 0 {
+		fmt.Fprintln(out, "  Assignment sources (mapped jobs):")
+		for _, source := range sortedStringKeys(projection.AssignmentSources) {
+			interval := projection.AssignmentSources[source]
+			fmt.Fprintf(out, "    %-36s median %8s  %d%% range %s-%s\n",
+				source, formatEstimateNumber(interval.Median), confidence,
+				formatEstimateNumber(interval.Lower), formatEstimateNumber(interval.Upper))
+		}
+	}
+}
+
+func printEstimateComputeDemand(out io.Writer, name string, demand estimateComputeDemand, confidence int) {
+	fmt.Fprintf(out, "  %-26s vCPU-min %.2f (%d%% range %.2f-%.2f)  peak %s (%s-%s)  p95 %s (%s-%s)\n",
+		name+":",
+		demand.VCPUMinutes.Median, confidence, demand.VCPUMinutes.Lower, demand.VCPUMinutes.Upper,
+		formatEstimateNumber(demand.PeakVCPUs.Median), formatEstimateNumber(demand.PeakVCPUs.Lower), formatEstimateNumber(demand.PeakVCPUs.Upper),
+		formatEstimateNumber(demand.PercentileVCPUs["p95"].Median), formatEstimateNumber(demand.PercentileVCPUs["p95"].Lower), formatEstimateNumber(demand.PercentileVCPUs["p95"].Upper))
 }
 
 func printEstimateLandscapeText(out io.Writer, landscape *estimateRepositoryLandscape, top int) {

@@ -263,13 +263,16 @@ func TestSimulateEstimateIntervalsContainExactSyntheticValue(t *testing.T) {
 			OS:           "linux",
 		}},
 	}}
-	metrics, warnings := simulateEstimate([]workflowRun{run1, run2}, sampled, config{
+	metrics, compute, warnings := simulateEstimate([]workflowRun{run1, run2}, sampled, config{
 		estimateSeed:       7,
 		estimateIterations: 50,
 		estimateConfidence: 90,
 	})
 	if len(warnings) != 0 {
 		t.Fatalf("warnings = %v, want empty", warnings)
+	}
+	if compute != nil {
+		t.Fatalf("compute = %#v, want nil without resource mapping", compute)
 	}
 	if metrics.JobsAnalyzed.Median != 2 {
 		t.Fatalf("jobs median = %v, want 2", metrics.JobsAnalyzed.Median)
@@ -279,6 +282,50 @@ func TestSimulateEstimateIntervalsContainExactSyntheticValue(t *testing.T) {
 	}
 	if metrics.PercentileConcurrency["p95"].Lower > 2 || metrics.PercentileConcurrency["p95"].Upper < 2 {
 		t.Fatalf("p95 interval = %#v, want to contain 2", metrics.PercentileConcurrency["p95"])
+	}
+}
+
+func TestSimulateEstimateIncludesVCPUIntervals(t *testing.T) {
+	run1 := workflowRun{ID: 1, Repo: "o/r", Name: "CI", WorkflowID: 1, Event: "push", RunStartedAt: dt("10:00:00").Format(time.RFC3339)}
+	run2 := workflowRun{ID: 2, Repo: "o/r", Name: "CI", WorkflowID: 1, Event: "push", RunStartedAt: dt("10:05:00").Format(time.RFC3339)}
+	sampled := []sampledRun{{
+		Run: run1,
+		Records: []record{{
+			Repo:         "o/r",
+			WorkflowName: "CI",
+			JobName:      "test",
+			Start:        dt("10:00:00"),
+			End:          dt("10:10:00"),
+			OS:           "linux",
+			Labels:       []string{"large"},
+		}},
+	}}
+	metrics, compute, warnings := simulateEstimate([]workflowRun{run1, run2}, sampled, config{
+		estimateSeed:       7,
+		estimateIterations: 20,
+		estimateConfidence: 90,
+		resourceMapFile:    "resources.json",
+		resourceRules: []resourceRule{{
+			Name: "large", Match: resourceMatch{Labels: []string{"large"}}, Target: resourceTarget{Platform: "linux", Shape: "medium", VCPUs: 4},
+		}},
+	})
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %v", warnings)
+	}
+	if metrics.JobsAnalyzed.Median != 2 {
+		t.Fatalf("jobs median = %v, want 2", metrics.JobsAnalyzed.Median)
+	}
+	if compute == nil {
+		t.Fatal("compute is nil")
+	}
+	if compute.Coverage.RuntimePercent.Median != 100 {
+		t.Fatalf("coverage = %#v", compute.Coverage)
+	}
+	if compute.Overall.VCPUMinutes.Median != 80 || compute.Overall.PeakVCPUs.Median != 8 || compute.Overall.PercentileVCPUs["p95"].Median != 8 {
+		t.Fatalf("overall = %#v, want 80 vCPU-min and peak/p95 8", compute.Overall)
+	}
+	if len(compute.Targets) != 1 || compute.Targets[0].Shape != "medium" || compute.Targets[0].VCPUsPerJob != 4 {
+		t.Fatalf("targets = %#v", compute.Targets)
 	}
 }
 
@@ -333,6 +380,7 @@ func TestRunEstimateBuildsReportFromFakeAPI(t *testing.T) {
 		estimateIterations:   20,
 		estimateConfidence:   90,
 		estimateSeed:         123,
+		defaultVCPUs:         2,
 	}, nil, nil, time.Now(), io.Discard)
 	if err != nil {
 		t.Fatal(err)
@@ -345,6 +393,16 @@ func TestRunEstimateBuildsReportFromFakeAPI(t *testing.T) {
 	}
 	if rep.Estimate.Metrics.PeakConcurrency.Median != 2 {
 		t.Fatalf("peak median = %v, want 2", rep.Estimate.Metrics.PeakConcurrency.Median)
+	}
+	if rep.Estimate.ComputeProjection == nil || rep.Estimate.ComputeProjection.Overall.VCPUMinutes.Median != 40 || rep.Estimate.ComputeProjection.Overall.PeakVCPUs.Median != 4 {
+		t.Fatalf("compute projection = %#v, want 40 vCPU-min and peak 4", rep.Estimate.ComputeProjection)
+	}
+	warnings := strings.Join(rep.Estimate.Warnings, "\n")
+	if !strings.Contains(warnings, "vCPU simulation assumes job durations remain unchanged") || !strings.Contains(warnings, "does not include Buildkite agent boot or dispatch time") {
+		t.Fatalf("warnings missing vCPU caveats:\n%s", warnings)
+	}
+	if strings.Contains(warnings, "Use --resource-map") {
+		t.Fatalf("warnings incorrectly claim mapping is absent:\n%s", warnings)
 	}
 	if rep.Estimate.RepositoryLandscape == nil || rep.Estimate.RepositoryLandscape.SelectedRepos != 1 {
 		t.Fatalf("repository landscape = %#v", rep.Estimate.RepositoryLandscape)

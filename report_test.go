@@ -260,6 +260,21 @@ func TestPrintTextEstimateModeIsProminent(t *testing.T) {
 					"p99": {Median: 4, Lower: 2, Upper: 8},
 				},
 			},
+			ComputeProjection: &estimateComputeProjection{
+				Model: "target_vcpu",
+				Coverage: estimateResourceCoverage{
+					TotalJobs:      estimateInterval{Median: 12, Lower: 9, Upper: 20},
+					MappedJobs:     estimateInterval{Median: 10, Lower: 8, Upper: 18},
+					RuntimePercent: estimateInterval{Median: 90, Lower: 80, Upper: 95},
+				},
+				Overall: estimateComputeDemand{
+					VCPUMinutes: estimateInterval{Median: 500, Lower: 400, Upper: 700},
+					PeakVCPUs:   estimateInterval{Median: 12, Lower: 8, Upper: 20},
+					PercentileVCPUs: map[string]estimateInterval{
+						"p95": {Median: 8, Lower: 6, Upper: 12},
+					},
+				},
+			},
 			RepositoryLandscape: &estimateRepositoryLandscape{
 				Strategy:      "actions_runs_then_metadata",
 				RankedRepos:   1,
@@ -281,10 +296,17 @@ func TestPrintTextEstimateModeIsProminent(t *testing.T) {
 	var out bytes.Buffer
 	printText(&out, rep)
 	text := out.String()
-	for _, want := range []string{"ESTIMATE MODE", "sampled 3 of 10", "Repository landscape", "#1 o/r", "Total job runtime:    median 180.00 job-min", "Peak job concurrency: median 4 jobs (90% range 2-8)", "not billing-grade exact"} {
+	for _, want := range []string{"ESTIMATE MODE", "sampled 3 of 10", "Repository landscape", "#1 o/r", "Total job runtime:    median 180.00 job-min", "Peak job concurrency: median 4 jobs (90% range 2-8)", "Buildkite vCPU projection (simulation intervals):", "vCPU-min 500.00 (90% range 400.00-700.00)", "not billing-grade exact"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("output missing %q:\n%s", want, text)
 		}
+	}
+	body, err := json.Marshal(rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `"estimate":{"seed":42`) || !strings.Contains(string(body), `"compute_projection":{"model":"target_vcpu"`) {
+		t.Fatalf("estimate JSON missing nested compute projection:\n%s", body)
 	}
 }
 

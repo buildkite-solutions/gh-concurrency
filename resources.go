@@ -237,6 +237,10 @@ func normalizedResourceTarget(target resourceTarget, rec record) resourceTarget 
 }
 
 func buildComputeProjection(records []record, cfg config) *computeProjection {
+	return buildComputeProjectionWithDetails(records, cfg, true)
+}
+
+func buildComputeProjectionWithDetails(records []record, cfg config, includeDetails bool) *computeProjection {
 	if cfg.resourceMapFile == "" && cfg.defaultVCPUs == 0 {
 		return nil
 	}
@@ -284,18 +288,21 @@ func buildComputeProjection(records []record, cfg config) *computeProjection {
 		platforms = append(platforms, computeDemandFor(platform, byPlatform[platform]))
 	}
 
-	return &computeProjection{
-		Model:                  "target_vcpu",
-		Coverage:               coverage,
-		AssignmentSources:      sources,
-		Overall:                computeDemandFor("", mapped),
-		Platforms:              platforms,
-		Targets:                computeTargetDemands(mapped),
-		UnmappedResourceGroups: summarizeUnmappedResources(unmapped),
-		TopRepositories:        topComputeUsageSummaries(mapped, cfg.top, func(rec record) string { return rec.Repo }),
-		TopWorkflows:           topComputeUsageSummaries(mapped, cfg.top, workflowSummaryName),
-		TopJobs:                topComputeUsageSummaries(mapped, cfg.top, jobSummaryName),
+	projection := &computeProjection{
+		Model:             "target_vcpu",
+		Coverage:          coverage,
+		AssignmentSources: sources,
+		Overall:           computeDemandFor("", mapped),
+		Platforms:         platforms,
+		Targets:           computeTargetDemands(mapped),
 	}
+	if includeDetails {
+		projection.UnmappedResourceGroups = summarizeUnmappedResources(unmapped)
+		projection.TopRepositories = topComputeUsageSummaries(mapped, cfg.top, func(rec record) string { return rec.Repo })
+		projection.TopWorkflows = topComputeUsageSummaries(mapped, cfg.top, workflowSummaryName)
+		projection.TopJobs = topComputeUsageSummaries(mapped, cfg.top, jobSummaryName)
+	}
+	return projection
 }
 
 type targetResourceKey struct {

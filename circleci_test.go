@@ -107,4 +107,18 @@ func TestCollectCircleCIProjectJobsUsesDetailsAndParallelism(t *testing.T) {
 	if peak != 2 {
 		t.Fatalf("peak = %d, want 2", peak)
 	}
+	projection := buildComputeProjection(result.Records, config{
+		resourceMapFile: "resources.json",
+		resourceRules: []resourceRule{{
+			Name:   "CircleCI large",
+			Match:  resourceMatch{Provider: circleCIProvider, ResourceClass: "large"},
+			Target: resourceTarget{Platform: "linux", Shape: "medium", VCPUs: 4},
+		}},
+	})
+	if projection == nil || projection.Coverage.RuntimePercent != 100 {
+		t.Fatalf("projection = %#v", projection)
+	}
+	if projection.Overall.VCPUMinutes != 80 || projection.Overall.PeakVCPUs != 8 {
+		t.Fatalf("CircleCI compute = %#v, want 80 vCPU-min and peak 8", projection.Overall)
+	}
 }

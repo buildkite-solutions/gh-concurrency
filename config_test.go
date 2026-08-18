@@ -101,13 +101,13 @@ func TestParseArgsResourceProjectionFlags(t *testing.T) {
 	}
 }
 
-func TestValidateConfigRejectsResourceProjectionInEstimateMode(t *testing.T) {
+func TestValidateConfigAcceptsResourceProjectionInEstimateMode(t *testing.T) {
 	for _, flag := range []string{"--resource-map=resources.json", "--default-vcpus=2"} {
 		cfg, err := parseArgs([]string{"--repo", "o/r", "--since", "2025-05-01", "--estimate", flag}, io.Discard)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "not yet supported with --estimate") {
+		if err := validateConfig(cfg); err != nil {
 			t.Fatalf("validateConfig(%s) err = %v", flag, err)
 		}
 	}
