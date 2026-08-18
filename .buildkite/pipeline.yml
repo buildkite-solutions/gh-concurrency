@@ -8,9 +8,14 @@ steps:
           version: 1.25.3
     command: "make test"
 
+  - label: ":docker: Validate Docker image"
+    key: "docker-build"
+    depends_on: "test"
+    command: "make docker-build-only"
+
   - label: ":github: Check GitHub release auth"
     key: "github-release-auth"
-    depends_on: "test"
+    depends_on: "docker-build"
     if: "build.tag =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+/ || build.env('RELEASE_TAG') =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+/"
     secrets:
       - GITHUB_APP_CLIENT_ID
@@ -44,7 +49,9 @@ steps:
     command: "scripts/publish-docker.sh"
 
   - label: ":github: Publish GitHub release"
-    depends_on: "release-binaries"
+    depends_on:
+      - "release-binaries"
+      - "docker"
     if: "build.tag =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+/ || build.env('RELEASE_TAG') =~ /^v[0-9]+\\.[0-9]+\\.[0-9]+/"
     secrets:
       - GITHUB_APP_CLIENT_ID

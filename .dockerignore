@@ -1,4 +1,5 @@
 # Deny everything, then allow only what the image build needs.
 *
 !go.mod
-!main.go
+!*.go
+*_test.go
