@@ -192,7 +192,9 @@ func normalizeJob(job workflowJob, repo string) (*record, error) {
 		OS:              inferOS(job.Labels),
 		SelfHosted:      isSelfHosted(job.Labels),
 		Labels:          append([]string{}, job.Labels...),
+		RunnerID:        job.RunnerID,
 		RunnerName:      strings.TrimSpace(job.RunnerName),
+		RunnerGroupID:   job.RunnerGroupID,
 		RunnerGroupName: strings.TrimSpace(job.RunnerGroupName),
 	}, nil
 }
@@ -204,8 +206,10 @@ func inferOS(labels []string) string {
 		return "windows"
 	case strings.Contains(joined, "macos"), strings.Contains(joined, "mac-"):
 		return "macos"
-	default:
+	case strings.Contains(joined, "ubuntu"), strings.Contains(joined, "linux"):
 		return "linux"
+	default:
+		return "unknown"
 	}
 }
 

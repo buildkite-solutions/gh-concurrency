@@ -82,6 +82,35 @@ func TestPrintTextIncludesRunnerPools(t *testing.T) {
 	}
 }
 
+func TestPrintTextIncludesRunnerHardware(t *testing.T) {
+	rep := report{
+		Version:               "test",
+		Parameters:            parameters{Repos: []string{"o/r"}, RepositoryCount: 1, Since: "2025-05-01", BaseURL: defaultBaseURL, RunnerInventory: true},
+		PercentileConcurrency: map[string]int{"p50": 1, "p90": 1, "p95": 1, "p99": 1},
+		RunnerPools: []runnerPool{{
+			Name:                  "GitHub-hosted/ubuntu-latest/private",
+			GitHubHosted:          true,
+			RunnerType:            "standard",
+			Jobs:                  10,
+			PeakConcurrency:       2,
+			PercentileConcurrency: map[string]int{"p95": 2},
+			CPUCores:              2,
+			MemoryGB:              8,
+			StorageGB:             14,
+			Architecture:          "x64",
+		}},
+	}
+
+	var out bytes.Buffer
+	printText(&out, rep)
+	text := out.String()
+	for _, want := range []string{"runner inventory: enabled", "GitHub-hosted/ubuntu-latest/private", "2 vCPU, 8 GB RAM", "14 GB SSD", "x64"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("output missing %q:\n%s", want, text)
+		}
+	}
+}
+
 func TestBuildReportIncludesScanSummaryAndTopSummaries(t *testing.T) {
 	records := []record{
 		{

@@ -115,6 +115,32 @@ func TestResolveTargetReposIncludesArchivedWhenRequested(t *testing.T) {
 	}
 }
 
+func TestResolveTargetReposWithInfoReadsVisibilityForIncludedArchivedDirectRepo(t *testing.T) {
+	responses := map[string]fakeResponse{
+		"/repos/acme/old": {
+			body: map[string]any{"full_name": "acme/old", "archived": true, "private": true, "visibility": "private"},
+		},
+	}
+	client := newGitHubClient("https://api.github.com", "tok", 1, false)
+	client.httpClient = &http.Client{Transport: fakeTransport{responses: responses}}
+	client.sleep = func(time.Duration) {}
+
+	repos, infos, skipped, err := resolveTargetReposWithInfo(client, config{
+		repos:           []string{"acme/old"},
+		repoType:        "all",
+		includeArchived: true,
+	}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(repos) != 1 || len(skipped) != 0 {
+		t.Fatalf("repos/skipped = %v/%v, want included archived repo", repos, skipped)
+	}
+	if info := infos["acme/old"]; !info.MetadataKnown || info.Visibility != "private" {
+		t.Fatalf("repository info = %#v, want known private visibility", info)
+	}
+}
+
 func TestResolveTargetReposSkipsArchivedDirectReposByDefault(t *testing.T) {
 	responses := map[string]fakeResponse{
 		"/repos/acme/live": {

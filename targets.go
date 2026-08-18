@@ -205,13 +205,6 @@ func circleCIProjectFromRepo(vcs, repo string) (string, error) {
 }
 
 func resolveDirectRepoInfos(client *githubClient, repos []string, includeArchived bool, stderr io.Writer) ([]repositoryInfo, []skippedRepository, error) {
-	if includeArchived {
-		var out []repositoryInfo
-		for _, repo := range uniqueRepos(repos) {
-			out = append(out, repositoryInfo{FullName: repo})
-		}
-		return out, nil, nil
-	}
 	var out []repositoryInfo
 	var skipped []skippedRepository
 	for _, repo := range uniqueRepos(repos) {
@@ -234,7 +227,7 @@ func resolveDirectRepoInfos(client *githubClient, repos []string, includeArchive
 			skipped = append(skipped, skippedRepository{Repo: info.FullName, Reason: "disabled"})
 			continue
 		}
-		if info.Archived {
+		if !includeArchived && info.Archived {
 			client.logf("skipping archived repository %s", info.FullName)
 			skipped = append(skipped, skippedRepository{Repo: info.FullName, Reason: "archived"})
 			continue
@@ -302,6 +295,8 @@ type repositoryInfo struct {
 	DefaultBranch   string `json:"default_branch"`
 	Fork            bool   `json:"fork"`
 	Private         bool   `json:"private"`
+	Visibility      string `json:"visibility"`
+	MetadataKnown   bool   `json:"-"`
 }
 
 func getRepoInfo(client *githubClient, repo string) (repositoryInfo, error) {
@@ -317,6 +312,7 @@ func getRepoInfo(client *githubClient, repo string) (repositoryInfo, error) {
 	if err := json.Unmarshal(body, &info); err != nil {
 		return repositoryInfo{}, err
 	}
+	info.MetadataKnown = true
 	return info, nil
 }
 
@@ -350,6 +346,7 @@ func listOrgRepoInfos(client *githubClient, org, repoType string, includeArchive
 		if err := json.Unmarshal(raw, &repo); err != nil {
 			return err
 		}
+		repo.MetadataKnown = true
 		if repo.FullName == "" {
 			return nil
 		}
