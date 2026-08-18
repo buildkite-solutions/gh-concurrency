@@ -4,11 +4,12 @@ Estimate how many CI jobs run at the same time, so you can compare
 GitHub Actions or CircleCI usage with a concurrency-based model like
 Buildkite's.
 
-GitHub Actions bills for the area under your usage curve. CircleCI exposes job
-history, but not a single cross-project concurrency profile. Buildkite plans
-are sized around the height of that curve, so `gh-concurrency` reconstructs it
-from job start and finish timestamps, then reports peak concurrency plus
-time-weighted percentiles.
+GitHub Actions exposes runner time and job history, while CircleCI exposes job
+history but not a single cross-project concurrency profile. `gh-concurrency`
+reconstructs job-slot demand from job start and finish timestamps, then reports
+total job runtime, peak job concurrency, and time-weighted percentiles. Job-slot
+concurrency is not vCPU capacity; runner-size mapping is required before using
+these results to estimate Buildkite Hosted Agent vCPU usage or capacity.
 
 The tool is a dependency-free Go binary. It makes authenticated `GET` requests
 only, never logs your token, and works either as a GitHub CLI extension or as a
@@ -262,8 +263,10 @@ Repository landscape: ranked 1,000 repos, selected 50, limit 50, probes complete
   #1 owner/api                            runs   14,230  size  180,301  pushed 2025-05-01  selected
 
 Jobs analyzed:        median 12,340 (90% range 10,900-15,100)
-Peak concurrency:     median 146 (90% range 105-230)
-p95 concurrency:      median 30 (90% range 22-48)
+Total job runtime:    median 820400.00 job-min (90% range 710000.00-970000.00)
+Active window time:   median 720.00h (90% range 700.00-744.00h)
+Peak job concurrency: median 146 jobs (90% range 105-230)
+p95 job concurrency:   median 30 jobs (90% range 22-48)
 ```
 
 Tune the request budget and reproducibility when needed:
@@ -283,7 +286,7 @@ gh concurrency \
 Estimated output is intentionally labeled as sampled simulation data. It is
 useful for sizing conversations and deciding whether a full exact scan is worth
 spending API quota on, but run exact mode before final commitments. Absolute
-peak concurrency is especially sensitive to rare unsampled fan-out.
+peak job concurrency is especially sensitive to rare unsampled fan-out.
 JSON output includes `estimate.repository_landscape` with each repo's rank,
 workflow-run count when known, metadata signals, and selected/not-selected
 status.
@@ -342,8 +345,10 @@ not supported by CircleCI; set `CIRCLECI_TOKEN`, `CIRCLE_TOKEN`, or pass
 ```text
 Jobs analyzed:        12,345
 Run time:             1m23.4s
-Peak concurrency:     42
-p95 concurrency:      18
+Total job runtime:    38420.50 job-min
+Active window time:   720.00h (>=1 job running)
+Peak job concurrency: 42 jobs
+p95 job concurrency:   18 jobs
 
 Scan summary:
   repositories: queued 74  scanned 70  skipped 4
@@ -351,20 +356,24 @@ Scan summary:
   API: 6,530 requests  2 retries  1 rate-limit sleeps (61.0s)
 
 Runner pools:
-  self-hosted/blacksmith        peak   48  p95   30     4,120 jobs
-  GitHub-hosted/ubuntu-latest/private       peak   12  p95    8       930 jobs  [standard; 2 vCPU, 8 GB RAM; 14 GB SSD; x64]
-  self-hosted/arc               peak    9  p95    6       310 jobs
+  self-hosted/blacksmith        peak   48 jobs  p95   30 jobs     4,120 total
+  GitHub-hosted/ubuntu-latest/private       peak   12 jobs  p95    8 jobs       930 total  [standard; 2 vCPU, 8 GB RAM; 14 GB SSD; x64]
+  self-hosted/arc               peak    9 jobs  p95    6 jobs       310 total
 
-Top repositories by busy time:
-  owner/api                                busy  123.45h  peak   12  p95    8     2,400 jobs
+Top repositories by total job runtime:
+  owner/api                             runtime  123.45h  peak   12 jobs  p95    8 jobs     2,400 total
 ```
 
-- Percentiles are time-weighted over busy time, when at least one job was
-  running.
+- Total job runtime sums every job's elapsed duration. Active window time is
+  the union of periods when at least one job was running, so overlapping jobs
+  increase total job runtime but not active window time.
+- Job-concurrency percentiles are time-weighted over active window time. They
+  count running job slots, not vCPUs.
 - Run time is measured by the tool itself, so you do not need to wrap the
   command in `time`.
-- Size toward p95/p99, not the absolute peak. One nightly fan-out should not
-  make you pay for that slot all month.
+- p95/p99 job concurrency can inform orchestration slot demand, but it is not a
+  Buildkite Hosted Agent vCPU capacity estimate. Jobs on 2-vCPU and 8-vCPU
+  runners each contribute one job slot in the current concurrency metrics.
 - Runner pools are derived from GitHub's workflow-job metadata. GitHub-hosted
   jobs are grouped by their exact label, with current standard-runner hardware
   specs added automatically. The optional larger-runner inventory adds the
@@ -375,16 +384,17 @@ Top repositories by busy time:
 - CircleCI runner pools are grouped by resource class when per-job details are
   enabled. Jobs with `parallelism` greater than one are expanded into multiple
   concurrent slots for concurrency math.
-- The billable-minutes estimate re-derives GitHub-hosted Actions minutes by
-  rounding each job up to the minute, then applying Linux x1, Windows x2, and
-  macOS x10 multipliers. Self-hosted jobs are treated as free. This section is
-  omitted for CircleCI scans.
+- The GitHub OS-multiplied minute estimate uses a standard-runner entitlement
+  model: it rounds each GitHub-hosted job up to the minute, then applies Linux
+  x1, Windows x2, and macOS x10 multipliers. It excludes self-hosted jobs but
+  does not model larger-runner SKUs or vCPU, and it is not a Buildkite
+  vCPU-minute estimate. This section is omitted for CircleCI scans.
 - Queue-time warnings mean measured concurrency is probably a floor. If jobs
   waited in GitHub's queue, true demand was higher than observed concurrency.
 - The scan summary explains how much data was collected, which repositories
   were skipped, and whether rate limits affected the run.
-- Top repositories, workflows, and jobs point at the biggest contributors to
-  busy time, so you can find the useful migration-sizing conversations faster.
+- Top repositories, workflows, and jobs are ranked by summed job runtime so you
+  can find the biggest workload contributors faster.
 
 Use `--format json` for machine-readable output. Progress and diagnostics are
 written to stderr so they do not corrupt JSON:

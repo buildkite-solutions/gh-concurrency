@@ -123,6 +123,16 @@ func TestPercentilesWeighted(t *testing.T) {
 	}
 }
 
+func TestTotalJobRuntimeSecondsSumsOverlappingJobs(t *testing.T) {
+	records := []record{
+		{Start: dt("10:00:00"), End: dt("10:05:00")},
+		{Start: dt("10:02:00"), End: dt("10:07:00")},
+	}
+	if got := totalJobRuntimeSeconds(records); got != 600 {
+		t.Fatalf("totalJobRuntimeSeconds = %v, want 600", got)
+	}
+}
+
 func TestBillableMinutesRoundsUp(t *testing.T) {
 	got := billableMinutes([]record{rec(61, "linux", false)})
 	if got["linux"].BillableMinutes != 2 {

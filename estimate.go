@@ -21,7 +21,9 @@ type estimateInterval struct {
 
 type estimateMetrics struct {
 	JobsAnalyzed          estimateInterval            `json:"jobs_analyzed"`
-	BusyHours             estimateInterval            `json:"busy_hours"`
+	BusyHours             estimateInterval            `json:"busy_hours"` // Deprecated: use ActiveWindowHours.
+	ActiveWindowHours     estimateInterval            `json:"active_window_hours"`
+	JobRuntimeMinutes     estimateInterval            `json:"job_runtime_minutes"`
 	PeakConcurrency       estimateInterval            `json:"peak_concurrency"`
 	PercentileConcurrency map[string]estimateInterval `json:"percentile_concurrency"`
 }
@@ -109,13 +111,14 @@ type runShape struct {
 }
 
 type simulationMetric struct {
-	JobsAnalyzed int
-	BusyHours    float64
-	Peak         int
-	P50          int
-	P90          int
-	P95          int
-	P99          int
+	JobsAnalyzed      int
+	ActiveWindowHours float64
+	JobRuntimeMinutes float64
+	Peak              int
+	P50               int
+	P90               int
+	P95               int
+	P99               int
 }
 
 func buildEstimateRepositoryLandscape(client *githubClient, repos []string, repoInfos map[string]repositoryInfo, opts collectOptions, cfg config, stderr io.Writer) (*estimateRepositoryLandscape, []string, []string, error) {
@@ -448,7 +451,8 @@ func runEstimate(client *githubClient, cfg config, repoInfos map[string]reposito
 	if !censusComplete {
 		warnings = append(warnings, "workflow-run census stopped before all target repositories/pages were read")
 	}
-	warnings = append(warnings, "Peak concurrency is sensitive to rare unsampled fan-out; run exact mode before final commitments.")
+	warnings = append(warnings, "Peak job concurrency is sensitive to rare unsampled fan-out; run exact mode before final commitments.")
+	warnings = append(warnings, "Concurrency metrics count running job slots, not vCPUs. Map runner sizes before using them to estimate Buildkite Hosted Agent vCPU capacity or usage.")
 
 	stats := client.statsSnapshot()
 	runtimeS := runtimeSeconds(time.Since(started))
@@ -487,15 +491,17 @@ func runEstimate(client *githubClient, cfg config, repoInfos map[string]reposito
 	}
 
 	rep := report{
-		Tool:            "gh-concurrency",
-		Version:         version,
-		GeneratedAt:     time.Now().UTC().Format(time.RFC3339),
-		RuntimeSeconds:  runtimeS,
-		Parameters:      buildParameters(cfg),
-		Scan:            summary,
-		JobsAnalyzed:    int(math.Round(metrics.JobsAnalyzed.Median)),
-		BusyHours:       roundFloat(metrics.BusyHours.Median, 2),
-		PeakConcurrency: int(math.Round(metrics.PeakConcurrency.Median)),
+		Tool:              "gh-concurrency",
+		Version:           version,
+		GeneratedAt:       time.Now().UTC().Format(time.RFC3339),
+		RuntimeSeconds:    runtimeS,
+		Parameters:        buildParameters(cfg),
+		Scan:              summary,
+		JobsAnalyzed:      int(math.Round(metrics.JobsAnalyzed.Median)),
+		BusyHours:         roundFloat(metrics.ActiveWindowHours.Median, 2),
+		ActiveWindowHours: roundFloat(metrics.ActiveWindowHours.Median, 2),
+		JobRuntimeMinutes: roundFloat(metrics.JobRuntimeMinutes.Median, 2),
+		PeakConcurrency:   int(math.Round(metrics.PeakConcurrency.Median)),
 		PercentileConcurrency: map[string]int{
 			"p50": int(math.Round(metrics.PercentileConcurrency["p50"].Median)),
 			"p90": int(math.Round(metrics.PercentileConcurrency["p90"].Median)),
@@ -857,13 +863,14 @@ func metricForRecords(records []record) simulationMetric {
 		busySeconds += seconds
 	}
 	return simulationMetric{
-		JobsAnalyzed: len(records),
-		BusyHours:    math.Round((busySeconds/3600.0)*100) / 100,
-		Peak:         peak,
-		P50:          pct[50],
-		P90:          pct[90],
-		P95:          pct[95],
-		P99:          pct[99],
+		JobsAnalyzed:      len(records),
+		ActiveWindowHours: roundedHours(busySeconds),
+		JobRuntimeMinutes: math.Round((totalJobRuntimeSeconds(records)/60.0)*100) / 100,
+		Peak:              peak,
+		P50:               pct[50],
+		P90:               pct[90],
+		P95:               pct[95],
+		P99:               pct[99],
 	}
 }
 
@@ -872,9 +879,11 @@ func intervalsForMetrics(values []simulationMetric, confidence int) estimateMetr
 		return emptyEstimateMetrics()
 	}
 	return estimateMetrics{
-		JobsAnalyzed:    intervalFromValues(values, confidence, func(v simulationMetric) float64 { return float64(v.JobsAnalyzed) }),
-		BusyHours:       intervalFromValues(values, confidence, func(v simulationMetric) float64 { return v.BusyHours }),
-		PeakConcurrency: intervalFromValues(values, confidence, func(v simulationMetric) float64 { return float64(v.Peak) }),
+		JobsAnalyzed:      intervalFromValues(values, confidence, func(v simulationMetric) float64 { return float64(v.JobsAnalyzed) }),
+		BusyHours:         intervalFromValues(values, confidence, func(v simulationMetric) float64 { return v.ActiveWindowHours }),
+		ActiveWindowHours: intervalFromValues(values, confidence, func(v simulationMetric) float64 { return v.ActiveWindowHours }),
+		JobRuntimeMinutes: intervalFromValues(values, confidence, func(v simulationMetric) float64 { return v.JobRuntimeMinutes }),
+		PeakConcurrency:   intervalFromValues(values, confidence, func(v simulationMetric) float64 { return float64(v.Peak) }),
 		PercentileConcurrency: map[string]estimateInterval{
 			"p50": intervalFromValues(values, confidence, func(v simulationMetric) float64 { return float64(v.P50) }),
 			"p90": intervalFromValues(values, confidence, func(v simulationMetric) float64 { return float64(v.P90) }),
@@ -889,6 +898,8 @@ func emptyEstimateMetrics() estimateMetrics {
 	return estimateMetrics{
 		JobsAnalyzed:          zero,
 		BusyHours:             zero,
+		ActiveWindowHours:     zero,
+		JobRuntimeMinutes:     zero,
 		PeakConcurrency:       zero,
 		PercentileConcurrency: map[string]estimateInterval{"p50": zero, "p90": zero, "p95": zero, "p99": zero},
 	}

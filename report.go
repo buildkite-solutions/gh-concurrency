@@ -50,7 +50,9 @@ type report struct {
 	Parameters              parameters              `json:"parameters"`
 	Scan                    scanSummary             `json:"scan"`
 	JobsAnalyzed            int                     `json:"jobs_analyzed"`
-	BusyHours               float64                 `json:"busy_hours"`
+	BusyHours               float64                 `json:"busy_hours"` // Deprecated: use ActiveWindowHours.
+	ActiveWindowHours       float64                 `json:"active_window_hours"`
+	JobRuntimeMinutes       float64                 `json:"job_runtime_minutes"`
 	PeakConcurrency         int                     `json:"peak_concurrency"`
 	PercentileConcurrency   map[string]int          `json:"percentile_concurrency"`
 	RunnerPools             []runnerPool            `json:"runner_pools"`
@@ -93,6 +95,11 @@ func buildReport(records []record, cfg config, runtime time.Duration, summary sc
 	if params.Provider == circleCIProvider && cfg.circleCIMaxPages > 0 {
 		warnings = append(warnings, fmt.Sprintf("CircleCI pipeline scanning was capped at %d pages per project; older matching pipelines may be undercounted.", cfg.circleCIMaxPages))
 	}
+	warnings = append(warnings, "Concurrency metrics count running job slots, not vCPUs. Map runner sizes before using them to estimate Buildkite Hosted Agent vCPU capacity or usage.")
+	if len(billable) > 0 {
+		warnings = append(warnings, "The GitHub minute estimate uses standard OS entitlement multipliers only; it does not model larger-runner SKUs or vCPU and is not a Buildkite vCPU-minute estimate.")
+	}
+	activeWindowHours := roundedHours(busySeconds)
 	return report{
 		Tool:                    "gh-concurrency",
 		Version:                 version,
@@ -101,7 +108,9 @@ func buildReport(records []record, cfg config, runtime time.Duration, summary sc
 		Parameters:              params,
 		Scan:                    summary,
 		JobsAnalyzed:            len(records),
-		BusyHours:               math.Round((busySeconds/3600.0)*100) / 100,
+		BusyHours:               activeWindowHours,
+		ActiveWindowHours:       activeWindowHours,
+		JobRuntimeMinutes:       math.Round((totalJobRuntimeSeconds(records)/60.0)*100) / 100,
 		PeakConcurrency:         peak,
 		PercentileConcurrency:   map[string]int{"p50": pct[50], "p90": pct[90], "p95": pct[95], "p99": pct[99]},
 		RunnerPools:             runnerPools(records),
