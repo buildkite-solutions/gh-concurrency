@@ -64,11 +64,13 @@ func printText(out io.Writer, rep report) {
 	}
 	fmt.Fprintf(out, "\nJobs analyzed:        %d\n", rep.JobsAnalyzed)
 	fmt.Fprintf(out, "Run time:             %s\n", formatRunDuration(rep.RuntimeSeconds))
-	fmt.Fprintf(out, "Busy wall-clock time: %.2fh (>=1 job running)\n", rep.BusyHours)
-	fmt.Fprintf(out, "Peak concurrency:     %d\n", rep.PeakConcurrency)
+	fmt.Fprintf(out, "Total job runtime:    %.2f job-min\n", rep.JobRuntimeMinutes)
+	fmt.Fprintf(out, "Active window time:   %.2fh (>=1 job running)\n", rep.ActiveWindowHours)
+	fmt.Fprintf(out, "Peak job concurrency: %d jobs\n", rep.PeakConcurrency)
 	for _, key := range []string{"p50", "p90", "p95", "p99"} {
-		fmt.Fprintf(out, "%s concurrency:       %d\n", key, rep.PercentileConcurrency[key])
+		fmt.Fprintf(out, "%s job concurrency:   %d jobs\n", key, rep.PercentileConcurrency[key])
 	}
+	printComputeProjection(out, rep.ComputeProjection)
 
 	printScanSummaryForProvider(out, rep.Scan, provider)
 
@@ -78,7 +80,7 @@ func printText(out io.Writer, rep report) {
 			hardware := runnerPoolHardwareSummary(pool)
 			fmt.Fprintf(
 				out,
-				"  %-42s peak %4d  p95 %4d  %8s jobs%s\n",
+				"  %-42s peak %4d jobs  p95 %4d jobs  %8s total%s\n",
 				pool.Name,
 				pool.PeakConcurrency,
 				pool.PercentileConcurrency["p95"],
@@ -88,12 +90,12 @@ func printText(out io.Writer, rep report) {
 		}
 	}
 
-	printUsageSummaries(out, "Top repositories by busy time:", rep.TopRepositories)
-	printUsageSummaries(out, "Top workflows by busy time:", rep.TopWorkflows)
-	printUsageSummaries(out, "Top jobs by busy time:", rep.TopJobs)
+	printUsageSummaries(out, "Top repositories by total job runtime:", rep.TopRepositories)
+	printUsageSummaries(out, "Top workflows by total job runtime:", rep.TopWorkflows)
+	printUsageSummaries(out, "Top jobs by total job runtime:", rep.TopJobs)
 
 	if len(rep.BillableMinutesEstimate) > 0 {
-		fmt.Fprintln(out, "\nBillable-minutes estimate (sanity-check vs your invoice):")
+		fmt.Fprintln(out, "\nGitHub OS-multiplied minute estimate (standard-runner model):")
 		total := 0
 		for _, osName := range sortedStringKeys(rep.BillableMinutesEstimate) {
 			slot := rep.BillableMinutesEstimate[osName]
@@ -101,15 +103,15 @@ func printText(out io.Writer, rep report) {
 			fmt.Fprintf(out, "  %-8s %6d jobs  %10s billable min\n", osName, slot.Jobs, comma(slot.BillableMinutes))
 		}
 		fmt.Fprintf(out, "  %-8s %6s       %10s billable min\n", "TOTAL", "", comma(total))
+		fmt.Fprintln(out, "  Scope: rounds each GitHub-hosted job to a minute and applies Linux x1,")
+		fmt.Fprintln(out, "  Windows x2, and macOS x10. Larger-runner SKUs and vCPU are not modeled;")
+		fmt.Fprintln(out, "  self-hosted jobs are excluded.")
 	}
 
 	if rep.QueueSeconds != nil {
 		q := rep.QueueSeconds
 		fmt.Fprintf(out, "\nQueue time: median %.0fs  p95 %.0fs  max %.0fs\n", q.MedianS, q.P95S, q.MaxS)
 	}
-
-	fmt.Fprintln(out, "\nSize Buildkite toward ~p95/p99, not the absolute peak: one 2am")
-	fmt.Fprintln(out, "cron fan-out should not make you pay for that slot all month.")
 
 	for _, warning := range rep.Warnings {
 		fmt.Fprintf(out, "\nWARNING: %s\n", warning)
@@ -138,6 +140,69 @@ func runnerPoolHardwareSummary(pool runnerPool) string {
 	return "  [" + strings.Join(details, "; ") + "]"
 }
 
+func printComputeProjection(out io.Writer, projection *computeProjection) {
+	if projection == nil {
+		return
+	}
+	coverage := projection.Coverage
+	fmt.Fprintln(out, "\nBuildkite vCPU projection (target resource assumptions):")
+	fmt.Fprintf(out, "  Coverage: %s/%s jobs (%.1f%%); %.2f/%.2f job-min (%.1f%%)\n",
+		comma(coverage.MappedJobs), comma(coverage.TotalJobs), coverage.JobPercent,
+		coverage.MappedRuntimeMinutes, coverage.TotalRuntimeMinutes, coverage.RuntimePercent)
+	printComputeDemand(out, "Overall", projection.Overall)
+	if len(projection.Platforms) > 0 {
+		fmt.Fprintln(out, "  Platforms:")
+		for _, demand := range projection.Platforms {
+			printComputeDemand(out, "    "+demand.Platform, demand)
+		}
+	}
+	if len(projection.Targets) > 0 {
+		fmt.Fprintln(out, "  Target groups:")
+		for _, demand := range projection.Targets {
+			name := demand.Platform
+			if demand.Shape != "" {
+				name += "/" + demand.Shape
+			}
+			name += fmt.Sprintf(" (%d vCPU/job)", demand.VCPUsPerJob)
+			printComputeDemand(out, "    "+name, demand)
+		}
+	}
+	if len(projection.AssignmentSources) > 0 {
+		fmt.Fprintln(out, "  Assignment sources:")
+		for _, source := range sortedStringKeys(projection.AssignmentSources) {
+			fmt.Fprintf(out, "    %-36s %8s jobs\n", source, comma(projection.AssignmentSources[source]))
+		}
+	}
+	if len(projection.UnmappedResourceGroups) > 0 {
+		fmt.Fprintln(out, "  Largest unmapped resource groups:")
+		shown := min(5, len(projection.UnmappedResourceGroups))
+		for _, group := range projection.UnmappedResourceGroups[:shown] {
+			fmt.Fprintf(out, "    %-52s %8s jobs  %10.2f job-min\n",
+				truncate(unmappedResourceName(group), 52), comma(group.Jobs), group.RuntimeMinutes)
+		}
+	}
+	printComputeUsageSummaries(out, "Top repositories by projected vCPU-minutes:", projection.TopRepositories)
+	printComputeUsageSummaries(out, "Top workflows by projected vCPU-minutes:", projection.TopWorkflows)
+	printComputeUsageSummaries(out, "Top jobs by projected vCPU-minutes:", projection.TopJobs)
+}
+
+func printComputeDemand(out io.Writer, name string, demand computeDemand) {
+	fmt.Fprintf(out, "  %-26s %10.2f vCPU-min  peak %5d vCPU  p95 %5d vCPU\n",
+		name+":", demand.VCPUMinutes, demand.PeakVCPUs, demand.PercentileVCPUs["p95"])
+}
+
+func printComputeUsageSummaries(out io.Writer, title string, summaries []computeUsageSummary) {
+	if len(summaries) == 0 {
+		return
+	}
+	fmt.Fprintf(out, "\n%s\n", title)
+	for _, summary := range summaries {
+		fmt.Fprintf(out, "  %-40s %10.2f vCPU-min  peak %5d  p95 %5d  %8s mapped jobs\n",
+			truncate(summary.Name, 40), summary.VCPUMinutes, summary.PeakVCPUs,
+			summary.PercentileVCPUs["p95"], comma(summary.Jobs))
+	}
+}
+
 func printEstimateText(out io.Writer, rep report) {
 	est := rep.Estimate
 	fmt.Fprintf(out, "\nESTIMATE MODE: sampled %s of %s known workflow runs; %d%% simulation interval; seed %d\n",
@@ -155,28 +220,77 @@ func printEstimateText(out io.Writer, rep report) {
 		formatEstimateNumber(est.Metrics.JobsAnalyzed.Lower),
 		formatEstimateNumber(est.Metrics.JobsAnalyzed.Upper))
 	fmt.Fprintf(out, "Run time:             %s\n", formatRunDuration(rep.RuntimeSeconds))
-	fmt.Fprintf(out, "Busy wall-clock time: median %.2fh (%d%% range %.2f-%.2fh)\n",
-		est.Metrics.BusyHours.Median, est.Confidence, est.Metrics.BusyHours.Lower, est.Metrics.BusyHours.Upper)
-	fmt.Fprintf(out, "Peak concurrency:     median %s (%d%% range %s-%s)\n",
+	fmt.Fprintf(out, "Total job runtime:    median %.2f job-min (%d%% range %.2f-%.2f)\n",
+		est.Metrics.JobRuntimeMinutes.Median, est.Confidence, est.Metrics.JobRuntimeMinutes.Lower, est.Metrics.JobRuntimeMinutes.Upper)
+	fmt.Fprintf(out, "Active window time:   median %.2fh (%d%% range %.2f-%.2fh)\n",
+		est.Metrics.ActiveWindowHours.Median, est.Confidence, est.Metrics.ActiveWindowHours.Lower, est.Metrics.ActiveWindowHours.Upper)
+	fmt.Fprintf(out, "Peak job concurrency: median %s jobs (%d%% range %s-%s)\n",
 		formatEstimateNumber(est.Metrics.PeakConcurrency.Median),
 		est.Confidence,
 		formatEstimateNumber(est.Metrics.PeakConcurrency.Lower),
 		formatEstimateNumber(est.Metrics.PeakConcurrency.Upper))
 	for _, key := range []string{"p50", "p90", "p95", "p99"} {
 		interval := est.Metrics.PercentileConcurrency[key]
-		fmt.Fprintf(out, "%s concurrency:       median %s (%d%% range %s-%s)\n",
+		fmt.Fprintf(out, "%s job concurrency:   median %s jobs (%d%% range %s-%s)\n",
 			key,
 			formatEstimateNumber(interval.Median),
 			est.Confidence,
 			formatEstimateNumber(interval.Lower),
 			formatEstimateNumber(interval.Upper))
 	}
+	printEstimateComputeProjection(out, est.ComputeProjection, est.Confidence)
 	printScanSummaryForProvider(out, rep.Scan, rep.Parameters.Provider)
 	fmt.Fprintln(out, "\nEstimate notes:")
 	fmt.Fprintln(out, "  These are sampled simulation intervals, not billing-grade exact measurements.")
 	for _, warning := range est.Warnings {
 		fmt.Fprintf(out, "  WARNING: %s\n", warning)
 	}
+}
+
+func printEstimateComputeProjection(out io.Writer, projection *estimateComputeProjection, confidence int) {
+	if projection == nil {
+		return
+	}
+	coverage := projection.Coverage
+	fmt.Fprintln(out, "\nBuildkite vCPU projection (simulation intervals):")
+	fmt.Fprintf(out, "  Coverage: median %s/%s mapped jobs; runtime %.1f%% (%d%% range %.1f-%.1f%%)\n",
+		formatEstimateNumber(coverage.MappedJobs.Median), formatEstimateNumber(coverage.TotalJobs.Median),
+		coverage.RuntimePercent.Median, confidence, coverage.RuntimePercent.Lower, coverage.RuntimePercent.Upper)
+	printEstimateComputeDemand(out, "Overall", projection.Overall, confidence)
+	if len(projection.Platforms) > 0 {
+		fmt.Fprintln(out, "  Platforms:")
+		for _, demand := range projection.Platforms {
+			printEstimateComputeDemand(out, "    "+demand.Platform, demand, confidence)
+		}
+	}
+	if len(projection.Targets) > 0 {
+		fmt.Fprintln(out, "  Target groups:")
+		for _, demand := range projection.Targets {
+			name := demand.Platform
+			if demand.Shape != "" {
+				name += "/" + demand.Shape
+			}
+			name += fmt.Sprintf(" (%d vCPU/job)", demand.VCPUsPerJob)
+			printEstimateComputeDemand(out, "    "+name, demand, confidence)
+		}
+	}
+	if len(projection.AssignmentSources) > 0 {
+		fmt.Fprintln(out, "  Assignment sources (mapped jobs):")
+		for _, source := range sortedStringKeys(projection.AssignmentSources) {
+			interval := projection.AssignmentSources[source]
+			fmt.Fprintf(out, "    %-36s median %8s  %d%% range %s-%s\n",
+				source, formatEstimateNumber(interval.Median), confidence,
+				formatEstimateNumber(interval.Lower), formatEstimateNumber(interval.Upper))
+		}
+	}
+}
+
+func printEstimateComputeDemand(out io.Writer, name string, demand estimateComputeDemand, confidence int) {
+	fmt.Fprintf(out, "  %-26s vCPU-min %.2f (%d%% range %.2f-%.2f)  peak %s (%s-%s)  p95 %s (%s-%s)\n",
+		name+":",
+		demand.VCPUMinutes.Median, confidence, demand.VCPUMinutes.Lower, demand.VCPUMinutes.Upper,
+		formatEstimateNumber(demand.PeakVCPUs.Median), formatEstimateNumber(demand.PeakVCPUs.Lower), formatEstimateNumber(demand.PeakVCPUs.Upper),
+		formatEstimateNumber(demand.PercentileVCPUs["p95"].Median), formatEstimateNumber(demand.PercentileVCPUs["p95"].Lower), formatEstimateNumber(demand.PercentileVCPUs["p95"].Upper))
 }
 
 func printEstimateLandscapeText(out io.Writer, landscape *estimateRepositoryLandscape, top int) {
@@ -277,9 +391,9 @@ func printUsageSummaries(out io.Writer, title string, summaries []usageSummary) 
 	for _, summary := range summaries {
 		fmt.Fprintf(
 			out,
-			"  %-40s busy %7.2fh  peak %4d  p95 %4d  %8s jobs\n",
+			"  %-40s runtime %7.2fh  peak %4d jobs  p95 %4d jobs  %8s total\n",
 			truncate(summary.Name, 40),
-			summary.BusyHours,
+			summary.JobRuntimeHours,
 			summary.PeakConcurrency,
 			summary.PercentileConcurrency["p95"],
 			comma(summary.Jobs),

@@ -83,6 +83,46 @@ func TestParseArgsPerformanceAndFilterFlags(t *testing.T) {
 	}
 }
 
+func TestParseArgsResourceProjectionFlags(t *testing.T) {
+	cfg, err := parseArgs([]string{
+		"--repo", "o/r",
+		"--since", "2025-05-01",
+		"--resource-map", "resources.json",
+		"--default-vcpus", "2",
+	}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.resourceMapFile != "resources.json" || cfg.defaultVCPUs != 2 {
+		t.Fatalf("resource flags = %q/%d", cfg.resourceMapFile, cfg.defaultVCPUs)
+	}
+	if err := validateConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidateConfigAcceptsResourceProjectionInEstimateMode(t *testing.T) {
+	for _, flag := range []string{"--resource-map=resources.json", "--default-vcpus=2"} {
+		cfg, err := parseArgs([]string{"--repo", "o/r", "--since", "2025-05-01", "--estimate", flag}, io.Discard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := validateConfig(cfg); err != nil {
+			t.Fatalf("validateConfig(%s) err = %v", flag, err)
+		}
+	}
+}
+
+func TestValidateConfigRejectsNegativeDefaultVCPUs(t *testing.T) {
+	cfg, err := parseArgs([]string{"--repo", "o/r", "--since", "2025-05-01", "--default-vcpus", "-1"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateConfig(cfg); err == nil || !strings.Contains(err.Error(), "--default-vcpus must be 0 or greater") {
+		t.Fatalf("validateConfig err = %v", err)
+	}
+}
+
 func TestParseArgsEstimateFlags(t *testing.T) {
 	cfg, err := parseArgs([]string{
 		"--repo", "o/r",

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +19,26 @@ func TestBuildReportIncludesRuntimeSeconds(t *testing.T) {
 	}, 1500*time.Millisecond, scanSummary{}, requestStats{})
 	if got.RuntimeSeconds != 1.5 {
 		t.Fatalf("runtime_seconds = %v, want 1.5", got.RuntimeSeconds)
+	}
+	if got.JobRuntimeMinutes != 1 {
+		t.Fatalf("job_runtime_minutes = %v, want 1", got.JobRuntimeMinutes)
+	}
+	if got.ActiveWindowHours != got.BusyHours {
+		t.Fatalf("active_window_hours/busy_hours = %v/%v, want backward-compatible aliases", got.ActiveWindowHours, got.BusyHours)
+	}
+}
+
+func TestBuildReportSeparatesJobRuntimeFromActiveWindow(t *testing.T) {
+	records := []record{
+		{Start: dt("10:00:00"), End: dt("10:10:00"), OS: "linux"},
+		{Start: dt("10:05:00"), End: dt("10:15:00"), OS: "linux"},
+	}
+	rep := buildReport(records, config{}, time.Second, scanSummary{}, requestStats{})
+	if rep.JobRuntimeMinutes != 20 {
+		t.Fatalf("job_runtime_minutes = %v, want 20", rep.JobRuntimeMinutes)
+	}
+	if rep.ActiveWindowHours != 0.25 {
+		t.Fatalf("active_window_hours = %v, want 0.25", rep.ActiveWindowHours)
 	}
 }
 
@@ -77,7 +98,7 @@ func TestPrintTextIncludesRunnerPools(t *testing.T) {
 	if !strings.Contains(text, "Runner pools:") {
 		t.Fatalf("output missing Runner pools section:\n%s", text)
 	}
-	if !strings.Contains(text, "self-hosted/blacksmith") || !strings.Contains(text, "4,120 jobs") {
+	if !strings.Contains(text, "self-hosted/blacksmith") || !strings.Contains(text, "peak   48 jobs") || !strings.Contains(text, "4,120 total") {
 		t.Fatalf("output missing runner pool details:\n%s", text)
 	}
 }
@@ -191,13 +212,13 @@ func TestPrintTextIncludesScanAndTopSummaries(t *testing.T) {
 			Conclusions:         map[string]int{"success": 2},
 		},
 		PercentileConcurrency: map[string]int{"p50": 1, "p90": 1, "p95": 1, "p99": 1},
-		TopRepositories:       []usageSummary{{Name: "o/r", Jobs: 2, BusyHours: 0.5, PeakConcurrency: 1, PercentileConcurrency: map[string]int{"p95": 1}}},
+		TopRepositories:       []usageSummary{{Name: "o/r", Jobs: 2, BusyHours: 0.5, ActiveWindowHours: 0.5, JobRuntimeHours: 0.75, PeakConcurrency: 1, PercentileConcurrency: map[string]int{"p95": 1}}},
 	}
 
 	var out bytes.Buffer
 	printText(&out, rep)
 	text := out.String()
-	for _, want := range []string{"Scan summary:", "API: 4 requests", "Top repositories by busy time:", "o/r"} {
+	for _, want := range []string{"Scan summary:", "API: 4 requests", "Top repositories by total job runtime:", "runtime    0.75h", "o/r"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("output missing %q:\n%s", want, text)
 		}
@@ -225,16 +246,33 @@ func TestPrintTextEstimateModeIsProminent(t *testing.T) {
 			Confidence:  90,
 			SampledRuns: 3,
 			KnownRuns:   10,
-			Warnings:    []string{"Peak concurrency is sensitive to rare unsampled fan-out; run exact mode before final commitments."},
+			Warnings:    []string{"Peak job concurrency is sensitive to rare unsampled fan-out; run exact mode before final commitments."},
 			Metrics: estimateMetrics{
-				JobsAnalyzed:    estimateInterval{Median: 12, Lower: 9, Upper: 20},
-				BusyHours:       estimateInterval{Median: 1.5, Lower: 1, Upper: 2},
-				PeakConcurrency: estimateInterval{Median: 4, Lower: 2, Upper: 8},
+				JobsAnalyzed:      estimateInterval{Median: 12, Lower: 9, Upper: 20},
+				BusyHours:         estimateInterval{Median: 1.5, Lower: 1, Upper: 2},
+				ActiveWindowHours: estimateInterval{Median: 1.5, Lower: 1, Upper: 2},
+				JobRuntimeMinutes: estimateInterval{Median: 180, Lower: 120, Upper: 240},
+				PeakConcurrency:   estimateInterval{Median: 4, Lower: 2, Upper: 8},
 				PercentileConcurrency: map[string]estimateInterval{
 					"p50": {Median: 1, Lower: 1, Upper: 2},
 					"p90": {Median: 2, Lower: 1, Upper: 4},
 					"p95": {Median: 3, Lower: 2, Upper: 5},
 					"p99": {Median: 4, Lower: 2, Upper: 8},
+				},
+			},
+			ComputeProjection: &estimateComputeProjection{
+				Model: "target_vcpu",
+				Coverage: estimateResourceCoverage{
+					TotalJobs:      estimateInterval{Median: 12, Lower: 9, Upper: 20},
+					MappedJobs:     estimateInterval{Median: 10, Lower: 8, Upper: 18},
+					RuntimePercent: estimateInterval{Median: 90, Lower: 80, Upper: 95},
+				},
+				Overall: estimateComputeDemand{
+					VCPUMinutes: estimateInterval{Median: 500, Lower: 400, Upper: 700},
+					PeakVCPUs:   estimateInterval{Median: 12, Lower: 8, Upper: 20},
+					PercentileVCPUs: map[string]estimateInterval{
+						"p95": {Median: 8, Lower: 6, Upper: 12},
+					},
 				},
 			},
 			RepositoryLandscape: &estimateRepositoryLandscape{
@@ -258,9 +296,84 @@ func TestPrintTextEstimateModeIsProminent(t *testing.T) {
 	var out bytes.Buffer
 	printText(&out, rep)
 	text := out.String()
-	for _, want := range []string{"ESTIMATE MODE", "sampled 3 of 10", "Repository landscape", "#1 o/r", "Peak concurrency:     median 4 (90% range 2-8)", "not billing-grade exact"} {
+	for _, want := range []string{"ESTIMATE MODE", "sampled 3 of 10", "Repository landscape", "#1 o/r", "Total job runtime:    median 180.00 job-min", "Peak job concurrency: median 4 jobs (90% range 2-8)", "Buildkite vCPU projection (simulation intervals):", "vCPU-min 500.00 (90% range 400.00-700.00)", "not billing-grade exact"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("output missing %q:\n%s", want, text)
+		}
+	}
+	body, err := json.Marshal(rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `"estimate":{"seed":42`) || !strings.Contains(string(body), `"compute_projection":{"model":"target_vcpu"`) {
+		t.Fatalf("estimate JSON missing nested compute projection:\n%s", body)
+	}
+}
+
+func TestPrintTextScopesGitHubMinuteEstimateAndConcurrency(t *testing.T) {
+	rep := buildReport([]record{rec(300, "linux", false)}, config{}, time.Second, scanSummary{}, requestStats{})
+	var out bytes.Buffer
+	printText(&out, rep)
+	text := out.String()
+	for _, want := range []string{
+		"GitHub OS-multiplied minute estimate (standard-runner model):",
+		"Larger-runner SKUs and vCPU are not modeled",
+		"Concurrency metrics count running job slots, not vCPUs",
+		"not a Buildkite vCPU-minute estimate",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("output missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestPrintTextIncludesComputeProjection(t *testing.T) {
+	small := rec(300, "linux", false)
+	small.Labels = []string{"small"}
+	large := rec(300, "linux", false)
+	large.Labels = []string{"large"}
+	rep := buildReport([]record{small, large}, config{
+		resourceMapFile: "resources.json",
+		resourceRules: []resourceRule{
+			{Name: "small", Match: resourceMatch{Labels: []string{"small"}}, Target: resourceTarget{Platform: "linux", Shape: "small", VCPUs: 2}},
+			{Name: "large", Match: resourceMatch{Labels: []string{"large"}}, Target: resourceTarget{Platform: "linux", Shape: "medium", VCPUs: 4}},
+		},
+		top: 10,
+	}, time.Second, scanSummary{}, requestStats{})
+	var out bytes.Buffer
+	printText(&out, rep)
+	text := out.String()
+	for _, want := range []string{
+		"Buildkite vCPU projection (target resource assumptions):",
+		"Coverage: 2/2 jobs (100.0%)",
+		"30.00 vCPU-min",
+		"peak     6 vCPU",
+		"linux/small (2 vCPU/job)",
+		"rule:large",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("output missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestReportJSONAddsComputeProjectionWithoutRemovingLegacyFields(t *testing.T) {
+	rep := buildReport([]record{rec(300, "linux", false)}, config{defaultVCPUs: 2}, time.Second, scanSummary{}, requestStats{})
+	body, err := json.Marshal(rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	for _, want := range []string{
+		`"busy_hours"`,
+		`"active_window_hours"`,
+		`"job_runtime_minutes"`,
+		`"compute_projection"`,
+		`"vcpu_minutes":10`,
+		`"peak_vcpus":2`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("JSON missing %s:\n%s", want, text)
 		}
 	}
 }

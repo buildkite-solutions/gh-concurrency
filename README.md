@@ -4,11 +4,12 @@ Estimate how many CI jobs run at the same time, so you can compare
 GitHub Actions or CircleCI usage with a concurrency-based model like
 Buildkite's.
 
-GitHub Actions bills for the area under your usage curve. CircleCI exposes job
-history, but not a single cross-project concurrency profile. Buildkite plans
-are sized around the height of that curve, so `gh-concurrency` reconstructs it
-from job start and finish timestamps, then reports peak concurrency plus
-time-weighted percentiles.
+GitHub Actions exposes runner time and job history, while CircleCI exposes job
+history but not a single cross-project concurrency profile. `gh-concurrency`
+reconstructs job-slot demand from job start and finish timestamps, then reports
+total job runtime, peak job concurrency, and time-weighted percentiles. Job-slot
+concurrency is not vCPU capacity; runner-size mapping is required before using
+these results to estimate Buildkite Hosted Agent vCPU usage or capacity.
 
 The tool is a dependency-free Go binary. It makes authenticated `GET` requests
 only, never logs your token, and works either as a GitHub CLI extension or as a
@@ -262,8 +263,14 @@ Repository landscape: ranked 1,000 repos, selected 50, limit 50, probes complete
   #1 owner/api                            runs   14,230  size  180,301  pushed 2025-05-01  selected
 
 Jobs analyzed:        median 12,340 (90% range 10,900-15,100)
-Peak concurrency:     median 146 (90% range 105-230)
-p95 concurrency:      median 30 (90% range 22-48)
+Total job runtime:    median 820400.00 job-min (90% range 710000.00-970000.00)
+Active window time:   median 720.00h (90% range 700.00-744.00h)
+Peak job concurrency: median 146 jobs (90% range 105-230)
+p95 job concurrency:   median 30 jobs (90% range 22-48)
+
+Buildkite vCPU projection (simulation intervals):
+  Coverage: median 11,900/12,340 mapped jobs; runtime 96.5% (90% range 93.0-98.0%)
+  Overall:                  vCPU-min 3125000.00 (90% range 2700000.00-3800000.00)  peak 320 (240-470)  p95 148 (115-205)
 ```
 
 Tune the request budget and reproducibility when needed:
@@ -276,6 +283,7 @@ gh concurrency \
   --estimate-max-requests 750 \
   --estimate-min-remaining 500 \
   --estimate-sample-runs 200 \
+  --resource-map buildkite-resources.json \
   --estimate-repo-limit 50 \
   --estimate-seed 12345
 ```
@@ -283,7 +291,7 @@ gh concurrency \
 Estimated output is intentionally labeled as sampled simulation data. It is
 useful for sizing conversations and deciding whether a full exact scan is worth
 spending API quota on, but run exact mode before final commitments. Absolute
-peak concurrency is especially sensitive to rare unsampled fan-out.
+peak job concurrency is especially sensitive to rare unsampled fan-out.
 JSON output includes `estimate.repository_landscape` with each repo's rank,
 workflow-run count when known, metadata signals, and selected/not-selected
 status.
@@ -342,8 +350,17 @@ not supported by CircleCI; set `CIRCLECI_TOKEN`, `CIRCLE_TOKEN`, or pass
 ```text
 Jobs analyzed:        12,345
 Run time:             1m23.4s
-Peak concurrency:     42
-p95 concurrency:      18
+Total job runtime:    38420.50 job-min
+Active window time:   720.00h (>=1 job running)
+Peak job concurrency: 42 jobs
+p95 job concurrency:   18 jobs
+
+Buildkite vCPU projection (target resource assumptions):
+  Coverage: 12,100/12,345 jobs (98.0%); 37920.50/38420.50 job-min (98.7%)
+  Overall:                  102340.25 vCPU-min  peak   104 vCPU  p95    72 vCPU
+  Platforms:
+      linux:                 98400.25 vCPU-min  peak    96 vCPU  p95    68 vCPU
+      macos:                  3940.00 vCPU-min  peak    12 vCPU  p95     6 vCPU
 
 Scan summary:
   repositories: queued 74  scanned 70  skipped 4
@@ -351,20 +368,25 @@ Scan summary:
   API: 6,530 requests  2 retries  1 rate-limit sleeps (61.0s)
 
 Runner pools:
-  self-hosted/blacksmith        peak   48  p95   30     4,120 jobs
-  GitHub-hosted/ubuntu-latest/private       peak   12  p95    8       930 jobs  [standard; 2 vCPU, 8 GB RAM; 14 GB SSD; x64]
-  self-hosted/arc               peak    9  p95    6       310 jobs
+  self-hosted/blacksmith        peak   48 jobs  p95   30 jobs     4,120 total
+  GitHub-hosted/ubuntu-latest/private       peak   12 jobs  p95    8 jobs       930 total  [standard; 2 vCPU, 8 GB RAM; 14 GB SSD; x64]
+  self-hosted/arc               peak    9 jobs  p95    6 jobs       310 total
 
-Top repositories by busy time:
-  owner/api                                busy  123.45h  peak   12  p95    8     2,400 jobs
+Top repositories by total job runtime:
+  owner/api                             runtime  123.45h  peak   12 jobs  p95    8 jobs     2,400 total
 ```
 
-- Percentiles are time-weighted over busy time, when at least one job was
-  running.
+- Total job runtime sums every job's elapsed duration. Active window time is
+  the union of periods when at least one job was running, so overlapping jobs
+  increase total job runtime but not active window time.
+- Job-concurrency percentiles are time-weighted over active window time. They
+  count running job slots, not vCPUs.
 - Run time is measured by the tool itself, so you do not need to wrap the
   command in `time`.
-- Size toward p95/p99, not the absolute peak. One nightly fan-out should not
-  make you pay for that slot all month.
+- p95/p99 job concurrency can inform orchestration slot demand, but it is not a
+  Buildkite Hosted Agent vCPU capacity estimate. Jobs on 2-vCPU and 8-vCPU
+  runners each contribute one job slot in the job-concurrency metrics. Supply a
+  resource map to calculate a separate vCPU-weighted projection.
 - Runner pools are derived from GitHub's workflow-job metadata. GitHub-hosted
   jobs are grouped by their exact label, with current standard-runner hardware
   specs added automatically. The optional larger-runner inventory adds the
@@ -375,16 +397,102 @@ Top repositories by busy time:
 - CircleCI runner pools are grouped by resource class when per-job details are
   enabled. Jobs with `parallelism` greater than one are expanded into multiple
   concurrent slots for concurrency math.
-- The billable-minutes estimate re-derives GitHub-hosted Actions minutes by
-  rounding each job up to the minute, then applying Linux x1, Windows x2, and
-  macOS x10 multipliers. Self-hosted jobs are treated as free. This section is
-  omitted for CircleCI scans.
+- The GitHub OS-multiplied minute estimate uses a standard-runner entitlement
+  model: it rounds each GitHub-hosted job up to the minute, then applies Linux
+  x1, Windows x2, and macOS x10 multipliers. It excludes self-hosted jobs but
+  does not model larger-runner SKUs or vCPU, and it is not a Buildkite
+  vCPU-minute estimate. This section is omitted for CircleCI scans.
 - Queue-time warnings mean measured concurrency is probably a floor. If jobs
   waited in GitHub's queue, true demand was higher than observed concurrency.
 - The scan summary explains how much data was collected, which repositories
   were skipped, and whether rate limits affected the run.
-- Top repositories, workflows, and jobs point at the biggest contributors to
-  busy time, so you can find the useful migration-sizing conversations faster.
+- Top repositories, workflows, and jobs are ranked by summed job runtime so you
+  can find the biggest workload contributors faster.
+
+### Project Buildkite vCPU Usage And Capacity
+
+Exact and estimated modes can map observed jobs to target Buildkite resources
+and calculate vCPU-weighted usage and capacity. Pass a JSON mapping file with
+`--resource-map`:
+
+```json
+{
+  "rules": [
+    {
+      "name": "large Linux tests",
+      "match": {
+        "provider": "github",
+        "repo": "acme/*",
+        "job": "test-large*",
+        "runner_group": "linux-*",
+        "labels": ["*8vcpu*"]
+      },
+      "target": {
+        "platform": "linux",
+        "shape": "large",
+        "vcpus": 8
+      }
+    },
+    {
+      "name": "standard Linux",
+      "match": {"labels": ["ubuntu-*"]},
+      "target": {"platform": "linux", "shape": "small", "vcpus": 2}
+    },
+    {
+      "name": "CircleCI large",
+      "match": {"provider": "circleci", "resource_class": "large"},
+      "target": {"platform": "linux", "shape": "medium", "vcpus": 4}
+    }
+  ]
+}
+```
+
+```bash
+gh concurrency \
+  --org acme \
+  --since 2025-05-01 \
+  --resource-map buildkite-resources.json
+```
+
+Rules are evaluated in order and the first match wins. String match fields use
+case-insensitive shell globs. Supported fields are `provider`, `repo`,
+`workflow`, `job`, `runner_name`, `runner_group`, `resource_class`, and
+`labels`; every listed label pattern must match at least one job label. An
+omitted target platform inherits the job's observed OS. The tool does not
+silently guess target vCPUs from runner labels; encode known source-to-target
+decisions as rules. The same format covers GitHub-hosted, self-hosted, and
+third-party runner labels as well as CircleCI resource classes. Provider
+catalogs are intentionally not hard-coded because custom and vendor resource
+classes change independently of this tool.
+
+Use `--default-vcpus N` to explicitly assign a fallback vCPU count to every
+unmatched job. Without a fallback, unmatched jobs remain unresolved. The output
+reports coverage by jobs and runtime, lists the largest unmapped resource
+groups, and does not silently extrapolate them. With partial coverage,
+vCPU-minutes and peak vCPU are mapped-workload minima; percentiles describe
+mapped-active time only and are not statistical bounds on the full workload.
+
+Exact projections report actual-duration vCPU-minutes, peak and time-weighted
+p50/p90/p95/p99 vCPU demand, platform and target-shape breakdowns, and top
+repositories, workflows, and jobs by projected vCPU-minutes. Estimate mode
+applies the same mapping rules to every simulated job shape and reports median
+and confidence intervals for mapping coverage, vCPU-minutes, peak and
+percentile vCPU demand, platforms, target groups, and assignment sources.
+
+Both modes assume job durations remain unchanged after migration; benchmark
+representative workloads before committing to target shapes. Capacity uses
+observed job execution intervals and does not add Buildkite agent boot or
+dispatch time. CircleCI parallel jobs are already expanded into concurrent
+execution slots, so a resource-class rule's vCPU value is applied once per
+parallel slot. Keep per-job details enabled so CircleCI resource classes and
+parallelism are available to the resolver.
+
+Exact JSON output adds top-level `compute_projection`, including `coverage`,
+`overall`, `platforms`, `targets`, `assignment_sources`, unmapped groups, and
+vCPU-weighted top summaries. Estimated JSON adds
+`estimate.compute_projection`, whose numeric metrics are simulation intervals.
+Existing job-concurrency and legacy `busy_hours` fields remain available for
+compatibility.
 
 Use `--format json` for machine-readable output. Progress and diagnostics are
 written to stderr so they do not corrupt JSON:

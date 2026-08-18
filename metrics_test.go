@@ -74,6 +74,16 @@ func TestConcurrencyProfileTimeAtLevel(t *testing.T) {
 	}
 }
 
+func TestWeightedConcurrencyProfile(t *testing.T) {
+	peak, profile := weightedConcurrencyProfile([]weightedInterval{
+		{Start: dt("10:00:00"), End: dt("10:05:00"), Weight: 2},
+		{Start: dt("10:00:00"), End: dt("10:05:00"), Weight: 4},
+	})
+	if peak != 6 || profile[6] != 300 {
+		t.Fatalf("peak/profile = %d/%v, want peak 6 for 300s", peak, profile)
+	}
+}
+
 func TestConcurrencyProfileMatchesBruteforceGrid(t *testing.T) {
 	rng := rand.New(rand.NewSource(7))
 	var intervals [][2]time.Time
@@ -120,6 +130,16 @@ func TestPercentilesWeighted(t *testing.T) {
 	}
 	if got[95] != 5 {
 		t.Fatalf("p95 = %d, want 5", got[95])
+	}
+}
+
+func TestTotalJobRuntimeSecondsSumsOverlappingJobs(t *testing.T) {
+	records := []record{
+		{Start: dt("10:00:00"), End: dt("10:05:00")},
+		{Start: dt("10:02:00"), End: dt("10:07:00")},
+	}
+	if got := totalJobRuntimeSeconds(records); got != 600 {
+		t.Fatalf("totalJobRuntimeSeconds = %v, want 600", got)
 	}
 }
 

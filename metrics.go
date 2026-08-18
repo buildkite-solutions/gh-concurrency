@@ -15,17 +15,33 @@ var osMultiplier = map[string]int{
 }
 
 func concurrencyProfile(intervals [][2]time.Time) (int, map[int]float64) {
+	weighted := make([]weightedInterval, 0, len(intervals))
+	for _, interval := range intervals {
+		weighted = append(weighted, weightedInterval{Start: interval[0], End: interval[1], Weight: 1})
+	}
+	return weightedConcurrencyProfile(weighted)
+}
+
+type weightedInterval struct {
+	Start  time.Time
+	End    time.Time
+	Weight int
+}
+
+func weightedConcurrencyProfile(intervals []weightedInterval) (int, map[int]float64) {
 	type event struct {
 		t     time.Time
 		delta int
 	}
 	var events []event
 	for _, interval := range intervals {
-		start, end := interval[0], interval[1]
-		if !end.After(start) {
+		if !interval.End.After(interval.Start) || interval.Weight <= 0 {
 			continue
 		}
-		events = append(events, event{t: start, delta: 1}, event{t: end, delta: -1})
+		events = append(events,
+			event{t: interval.Start, delta: interval.Weight},
+			event{t: interval.End, delta: -interval.Weight},
+		)
 	}
 	sort.Slice(events, func(i, j int) bool {
 		if events[i].t.Equal(events[j].t) {
@@ -122,7 +138,9 @@ type runnerPool struct {
 	Name                  string         `json:"name"`
 	Provider              string         `json:"provider,omitempty"`
 	Jobs                  int            `json:"jobs"`
-	BusyHours             float64        `json:"busy_hours"`
+	BusyHours             float64        `json:"busy_hours"` // Deprecated: use ActiveWindowHours.
+	ActiveWindowHours     float64        `json:"active_window_hours"`
+	JobRuntimeHours       float64        `json:"job_runtime_hours"`
 	PeakConcurrency       int            `json:"peak_concurrency"`
 	PercentileConcurrency map[string]int `json:"percentile_concurrency"`
 	GitHubHosted          bool           `json:"github_hosted"`
@@ -148,7 +166,9 @@ type runnerPool struct {
 type usageSummary struct {
 	Name                  string         `json:"name"`
 	Jobs                  int            `json:"jobs"`
-	BusyHours             float64        `json:"busy_hours"`
+	BusyHours             float64        `json:"busy_hours"` // Deprecated: use ActiveWindowHours.
+	ActiveWindowHours     float64        `json:"active_window_hours"`
+	JobRuntimeHours       float64        `json:"job_runtime_hours"`
 	PeakConcurrency       int            `json:"peak_concurrency"`
 	PercentileConcurrency map[string]int `json:"percentile_concurrency"`
 }
@@ -195,12 +215,16 @@ func runnerPools(records []record) []runnerPool {
 		for _, seconds := range profile {
 			busySeconds += seconds
 		}
+		activeWindowHours := roundedHours(busySeconds)
+		jobRuntimeHours := roundedHours(totalJobRuntimeSeconds(poolRecords))
 
 		pools = append(pools, runnerPool{
 			Name:                  key.name,
 			Provider:              key.provider,
 			Jobs:                  len(poolRecords),
-			BusyHours:             math.Round((busySeconds/3600.0)*100) / 100,
+			BusyHours:             activeWindowHours,
+			ActiveWindowHours:     activeWindowHours,
+			JobRuntimeHours:       jobRuntimeHours,
 			PeakConcurrency:       peak,
 			PercentileConcurrency: map[string]int{"p50": pct[50], "p90": pct[90], "p95": pct[95], "p99": pct[99]},
 			GitHubHosted:          key.gitHubHosted,
@@ -253,8 +277,8 @@ func topUsageSummaries(records []record, top int, keyFor func(record) string) []
 		summaries = append(summaries, summarizeUsage(name, groupRecords))
 	}
 	sort.Slice(summaries, func(i, j int) bool {
-		if summaries[i].BusyHours != summaries[j].BusyHours {
-			return summaries[i].BusyHours > summaries[j].BusyHours
+		if summaries[i].JobRuntimeHours != summaries[j].JobRuntimeHours {
+			return summaries[i].JobRuntimeHours > summaries[j].JobRuntimeHours
 		}
 		if summaries[i].Jobs != summaries[j].Jobs {
 			return summaries[i].Jobs > summaries[j].Jobs
@@ -281,13 +305,30 @@ func summarizeUsage(name string, records []record) usageSummary {
 	for _, seconds := range profile {
 		busySeconds += seconds
 	}
+	activeWindowHours := roundedHours(busySeconds)
 	return usageSummary{
 		Name:                  name,
 		Jobs:                  len(records),
-		BusyHours:             math.Round((busySeconds/3600.0)*100) / 100,
+		BusyHours:             activeWindowHours,
+		ActiveWindowHours:     activeWindowHours,
+		JobRuntimeHours:       roundedHours(totalJobRuntimeSeconds(records)),
 		PeakConcurrency:       peak,
 		PercentileConcurrency: map[string]int{"p50": pct[50], "p90": pct[90], "p95": pct[95], "p99": pct[99]},
 	}
+}
+
+func totalJobRuntimeSeconds(records []record) float64 {
+	total := 0.0
+	for _, rec := range records {
+		if rec.End.After(rec.Start) {
+			total += rec.End.Sub(rec.Start).Seconds()
+		}
+	}
+	return total
+}
+
+func roundedHours(seconds float64) float64 {
+	return math.Round((seconds/3600.0)*100) / 100
 }
 
 func workflowSummaryName(rec record) string {
@@ -463,7 +504,7 @@ func detectWarnings(provider string, peak int, pct map[int]int, qstats *queueSta
 	var warnings []string
 	if qstats != nil && qstats.P95S > 60 {
 		warnings = append(warnings, fmt.Sprintf(
-			"95th-percentile queue time is %.0fs. Sustained queueing means jobs waited instead of running in parallel, so true demand is likely higher than the concurrency reported here.",
+			"95th-percentile queue time is %.0fs. Sustained queueing means jobs waited instead of running in parallel, so true demand is likely higher than the job concurrency reported here.",
 			qstats.P95S,
 		))
 	}
@@ -474,7 +515,7 @@ func detectWarnings(provider string, peak int, pct map[int]int, qstats *queueSta
 			limitName = "a CircleCI concurrency or resource limit"
 		}
 		warnings = append(warnings, fmt.Sprintf(
-			"Peak (%d) sits at a round number and equals p95, which can indicate you were hitting %s. If so, real demand exceeds this figure.",
+			"Peak job concurrency (%d) sits at a round number and equals p95, which can indicate you were hitting %s. If so, real demand exceeds this figure.",
 			peak, limitName,
 		))
 	}
