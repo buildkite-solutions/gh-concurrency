@@ -350,6 +350,13 @@ Active window time:   720.00h (>=1 job running)
 Peak job concurrency: 42 jobs
 p95 job concurrency:   18 jobs
 
+Buildkite vCPU projection (target resource assumptions):
+  Coverage: 12,100/12,345 jobs (98.0%); 37920.50/38420.50 job-min (98.7%)
+  Overall:                  102340.25 vCPU-min  peak   104 vCPU  p95    72 vCPU
+  Platforms:
+      linux:                 98400.25 vCPU-min  peak    96 vCPU  p95    68 vCPU
+      macos:                  3940.00 vCPU-min  peak    12 vCPU  p95     6 vCPU
+
 Scan summary:
   repositories: queued 74  scanned 70  skipped 4
   workflow runs: 3,210  workflow jobs seen: 12,800  jobs used: 12,345
@@ -373,7 +380,8 @@ Top repositories by total job runtime:
   command in `time`.
 - p95/p99 job concurrency can inform orchestration slot demand, but it is not a
   Buildkite Hosted Agent vCPU capacity estimate. Jobs on 2-vCPU and 8-vCPU
-  runners each contribute one job slot in the current concurrency metrics.
+  runners each contribute one job slot in the job-concurrency metrics. Supply a
+  resource map to calculate a separate vCPU-weighted projection.
 - Runner pools are derived from GitHub's workflow-job metadata. GitHub-hosted
   jobs are grouped by their exact label, with current standard-runner hardware
   specs added automatically. The optional larger-runner inventory adds the
@@ -395,6 +403,75 @@ Top repositories by total job runtime:
   were skipped, and whether rate limits affected the run.
 - Top repositories, workflows, and jobs are ranked by summed job runtime so you
   can find the biggest workload contributors faster.
+
+### Project Buildkite vCPU Usage And Capacity
+
+Exact mode can map observed jobs to target Buildkite resources and calculate
+vCPU-weighted usage and capacity. Pass a JSON mapping file with
+`--resource-map`:
+
+```json
+{
+  "rules": [
+    {
+      "name": "large Linux tests",
+      "match": {
+        "provider": "github",
+        "repo": "acme/*",
+        "job": "test-large*",
+        "runner_group": "linux-*",
+        "labels": ["*8vcpu*"]
+      },
+      "target": {
+        "platform": "linux",
+        "shape": "large",
+        "vcpus": 8
+      }
+    },
+    {
+      "name": "standard Linux",
+      "match": {"labels": ["ubuntu-*"]},
+      "target": {"platform": "linux", "shape": "small", "vcpus": 2}
+    }
+  ]
+}
+```
+
+```bash
+gh concurrency \
+  --org acme \
+  --since 2025-05-01 \
+  --resource-map buildkite-resources.json
+```
+
+Rules are evaluated in order and the first match wins. String match fields use
+case-insensitive shell globs. Supported fields are `provider`, `repo`,
+`workflow`, `job`, `runner_name`, `runner_group`, `resource_class`, and
+`labels`; every listed label pattern must match at least one job label. An
+omitted target platform inherits the job's observed OS. The tool does not
+silently guess target vCPUs from runner labels; encode known source-to-target
+decisions as rules.
+
+Use `--default-vcpus N` to explicitly assign a fallback vCPU count to every
+unmatched job. Without a fallback, unmatched jobs remain unresolved. The output
+reports coverage by jobs and runtime, lists the largest unmapped resource
+groups, and does not silently extrapolate them. With partial coverage,
+vCPU-minutes and peak vCPU are mapped-workload minima; percentiles describe
+mapped-active time only and are not statistical bounds on the full workload.
+
+The projection reports actual-duration vCPU-minutes, peak and time-weighted
+p50/p90/p95/p99 vCPU demand, platform and target-shape breakdowns, and top
+repositories, workflows, and jobs by projected vCPU-minutes. It assumes job
+durations remain unchanged after migration; benchmark representative workloads
+before committing to target shapes. Capacity uses observed job execution
+intervals and does not add Buildkite agent boot or dispatch time. Resource maps
+are currently exact-mode only, so `--estimate` rejects `--resource-map` and
+`--default-vcpus` rather than returning unweighted simulation results.
+
+JSON output adds `compute_projection`, including `coverage`, `overall`,
+`platforms`, `targets`, `assignment_sources`, unmapped groups, and vCPU-weighted
+top summaries. Existing job-concurrency and legacy `busy_hours` fields remain
+available for compatibility.
 
 Use `--format json` for machine-readable output. Progress and diagnostics are
 written to stderr so they do not corrupt JSON:

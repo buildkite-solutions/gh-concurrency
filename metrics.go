@@ -15,17 +15,33 @@ var osMultiplier = map[string]int{
 }
 
 func concurrencyProfile(intervals [][2]time.Time) (int, map[int]float64) {
+	weighted := make([]weightedInterval, 0, len(intervals))
+	for _, interval := range intervals {
+		weighted = append(weighted, weightedInterval{Start: interval[0], End: interval[1], Weight: 1})
+	}
+	return weightedConcurrencyProfile(weighted)
+}
+
+type weightedInterval struct {
+	Start  time.Time
+	End    time.Time
+	Weight int
+}
+
+func weightedConcurrencyProfile(intervals []weightedInterval) (int, map[int]float64) {
 	type event struct {
 		t     time.Time
 		delta int
 	}
 	var events []event
 	for _, interval := range intervals {
-		start, end := interval[0], interval[1]
-		if !end.After(start) {
+		if !interval.End.After(interval.Start) || interval.Weight <= 0 {
 			continue
 		}
-		events = append(events, event{t: start, delta: 1}, event{t: end, delta: -1})
+		events = append(events,
+			event{t: interval.Start, delta: interval.Weight},
+			event{t: interval.End, delta: -interval.Weight},
+		)
 	}
 	sort.Slice(events, func(i, j int) bool {
 		if events[i].t.Equal(events[j].t) {

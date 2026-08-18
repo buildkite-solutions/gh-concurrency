@@ -32,6 +32,8 @@ type parameters struct {
 	ExcludePullRequests  bool     `json:"exclude_pull_requests"`
 	RunnerInventory      bool     `json:"runner_inventory"`
 	Top                  int      `json:"top"`
+	ResourceMapFile      string   `json:"resource_map_file,omitempty"`
+	DefaultVCPUs         int      `json:"default_vcpus,omitempty"`
 	Mode                 string   `json:"mode"`
 	EstimateMaxRequests  int      `json:"estimate_max_requests,omitempty"`
 	EstimateMinRemaining int      `json:"estimate_min_remaining,omitempty"`
@@ -60,6 +62,7 @@ type report struct {
 	TopWorkflows            []usageSummary          `json:"top_workflows,omitempty"`
 	TopJobs                 []usageSummary          `json:"top_jobs,omitempty"`
 	BillableMinutesEstimate map[string]billableSlot `json:"billable_minutes_estimate"`
+	ComputeProjection       *computeProjection      `json:"compute_projection,omitempty"`
 	QueueSeconds            *queueStats             `json:"queue_seconds"`
 	Warnings                []string                `json:"warnings"`
 	Estimate                *estimateReport         `json:"estimate,omitempty"`
@@ -84,6 +87,7 @@ func buildReport(records []record, cfg config, runtime time.Duration, summary sc
 	summary.RateLimitSleepSeconds = stats.RateLimitSleepSeconds
 	summary.RuntimeSeconds = runtimeS
 	params := buildParameters(cfg)
+	compute := buildComputeProjection(records, cfg)
 	billable := billableMinutes(records)
 	if params.Provider == circleCIProvider {
 		billable = nil
@@ -95,7 +99,15 @@ func buildReport(records []record, cfg config, runtime time.Duration, summary sc
 	if params.Provider == circleCIProvider && cfg.circleCIMaxPages > 0 {
 		warnings = append(warnings, fmt.Sprintf("CircleCI pipeline scanning was capped at %d pages per project; older matching pipelines may be undercounted.", cfg.circleCIMaxPages))
 	}
-	warnings = append(warnings, "Concurrency metrics count running job slots, not vCPUs. Map runner sizes before using them to estimate Buildkite Hosted Agent vCPU capacity or usage.")
+	if compute == nil {
+		warnings = append(warnings, "Concurrency metrics count running job slots, not vCPUs. Use --resource-map or --default-vcpus before using them to estimate Buildkite Hosted Agent vCPU capacity or usage.")
+	} else {
+		warnings = append(warnings, "The vCPU projection assumes job durations remain unchanged on the target Buildkite agents; validate target shapes with representative workloads.")
+		warnings = append(warnings, "The vCPU capacity projection uses observed job execution intervals and does not include Buildkite agent boot or dispatch time.")
+		if compute.Coverage.UnmappedJobs > 0 {
+			warnings = append(warnings, fmt.Sprintf("The vCPU projection covers %.1f%% of job runtime. Projected vCPU-minutes and peak are mapped-workload minima; percentiles describe mapped-active time only.", compute.Coverage.RuntimePercent))
+		}
+	}
 	if len(billable) > 0 {
 		warnings = append(warnings, "The GitHub minute estimate uses standard OS entitlement multipliers only; it does not model larger-runner SKUs or vCPU and is not a Buildkite vCPU-minute estimate.")
 	}
@@ -118,6 +130,7 @@ func buildReport(records []record, cfg config, runtime time.Duration, summary sc
 		TopWorkflows:            topUsageSummaries(records, cfg.top, workflowSummaryName),
 		TopJobs:                 topUsageSummaries(records, cfg.top, jobSummaryName),
 		BillableMinutesEstimate: billable,
+		ComputeProjection:       compute,
 		QueueSeconds:            qstats,
 		Warnings:                warnings,
 	}
@@ -152,6 +165,8 @@ func buildParameters(cfg config) parameters {
 		ExcludePullRequests: cfg.excludePullRequests,
 		RunnerInventory:     cfg.runnerInventory,
 		Top:                 cfg.top,
+		ResourceMapFile:     cfg.resourceMapFile,
+		DefaultVCPUs:        cfg.defaultVCPUs,
 		Mode:                modeName(cfg),
 	}
 	if provider == circleCIProvider {

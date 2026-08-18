@@ -26,6 +26,13 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "gh-concurrency %s (commit %s, built %s)\n", version, commit, date)
 		return 0
 	}
+	if cfg.resourceMapFile != "" {
+		cfg.resourceRules, err = loadResourceMap(cfg.resourceMapFile)
+		if err != nil {
+			fmt.Fprintf(stderr, "error: load resource map: %v\n", err)
+			return 2
+		}
+	}
 
 	token, err := resolveToken(cfg)
 	if err != nil {

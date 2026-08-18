@@ -74,6 +74,16 @@ func TestConcurrencyProfileTimeAtLevel(t *testing.T) {
 	}
 }
 
+func TestWeightedConcurrencyProfile(t *testing.T) {
+	peak, profile := weightedConcurrencyProfile([]weightedInterval{
+		{Start: dt("10:00:00"), End: dt("10:05:00"), Weight: 2},
+		{Start: dt("10:00:00"), End: dt("10:05:00"), Weight: 4},
+	})
+	if peak != 6 || profile[6] != 300 {
+		t.Fatalf("peak/profile = %d/%v, want peak 6 for 300s", peak, profile)
+	}
+}
+
 func TestConcurrencyProfileMatchesBruteforceGrid(t *testing.T) {
 	rng := rand.New(rand.NewSource(7))
 	var intervals [][2]time.Time

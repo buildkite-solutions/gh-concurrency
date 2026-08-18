@@ -70,6 +70,7 @@ func printText(out io.Writer, rep report) {
 	for _, key := range []string{"p50", "p90", "p95", "p99"} {
 		fmt.Fprintf(out, "%s job concurrency:   %d jobs\n", key, rep.PercentileConcurrency[key])
 	}
+	printComputeProjection(out, rep.ComputeProjection)
 
 	printScanSummaryForProvider(out, rep.Scan, provider)
 
@@ -137,6 +138,69 @@ func runnerPoolHardwareSummary(pool runnerPool) string {
 		details = append(details, pool.Architecture)
 	}
 	return "  [" + strings.Join(details, "; ") + "]"
+}
+
+func printComputeProjection(out io.Writer, projection *computeProjection) {
+	if projection == nil {
+		return
+	}
+	coverage := projection.Coverage
+	fmt.Fprintln(out, "\nBuildkite vCPU projection (target resource assumptions):")
+	fmt.Fprintf(out, "  Coverage: %s/%s jobs (%.1f%%); %.2f/%.2f job-min (%.1f%%)\n",
+		comma(coverage.MappedJobs), comma(coverage.TotalJobs), coverage.JobPercent,
+		coverage.MappedRuntimeMinutes, coverage.TotalRuntimeMinutes, coverage.RuntimePercent)
+	printComputeDemand(out, "Overall", projection.Overall)
+	if len(projection.Platforms) > 0 {
+		fmt.Fprintln(out, "  Platforms:")
+		for _, demand := range projection.Platforms {
+			printComputeDemand(out, "    "+demand.Platform, demand)
+		}
+	}
+	if len(projection.Targets) > 0 {
+		fmt.Fprintln(out, "  Target groups:")
+		for _, demand := range projection.Targets {
+			name := demand.Platform
+			if demand.Shape != "" {
+				name += "/" + demand.Shape
+			}
+			name += fmt.Sprintf(" (%d vCPU/job)", demand.VCPUsPerJob)
+			printComputeDemand(out, "    "+name, demand)
+		}
+	}
+	if len(projection.AssignmentSources) > 0 {
+		fmt.Fprintln(out, "  Assignment sources:")
+		for _, source := range sortedStringKeys(projection.AssignmentSources) {
+			fmt.Fprintf(out, "    %-36s %8s jobs\n", source, comma(projection.AssignmentSources[source]))
+		}
+	}
+	if len(projection.UnmappedResourceGroups) > 0 {
+		fmt.Fprintln(out, "  Largest unmapped resource groups:")
+		shown := min(5, len(projection.UnmappedResourceGroups))
+		for _, group := range projection.UnmappedResourceGroups[:shown] {
+			fmt.Fprintf(out, "    %-52s %8s jobs  %10.2f job-min\n",
+				truncate(unmappedResourceName(group), 52), comma(group.Jobs), group.RuntimeMinutes)
+		}
+	}
+	printComputeUsageSummaries(out, "Top repositories by projected vCPU-minutes:", projection.TopRepositories)
+	printComputeUsageSummaries(out, "Top workflows by projected vCPU-minutes:", projection.TopWorkflows)
+	printComputeUsageSummaries(out, "Top jobs by projected vCPU-minutes:", projection.TopJobs)
+}
+
+func printComputeDemand(out io.Writer, name string, demand computeDemand) {
+	fmt.Fprintf(out, "  %-26s %10.2f vCPU-min  peak %5d vCPU  p95 %5d vCPU\n",
+		name+":", demand.VCPUMinutes, demand.PeakVCPUs, demand.PercentileVCPUs["p95"])
+}
+
+func printComputeUsageSummaries(out io.Writer, title string, summaries []computeUsageSummary) {
+	if len(summaries) == 0 {
+		return
+	}
+	fmt.Fprintf(out, "\n%s\n", title)
+	for _, summary := range summaries {
+		fmt.Fprintf(out, "  %-40s %10.2f vCPU-min  peak %5d  p95 %5d  %8s mapped jobs\n",
+			truncate(summary.Name, 40), summary.VCPUMinutes, summary.PeakVCPUs,
+			summary.PercentileVCPUs["p95"], comma(summary.Jobs))
+	}
 }
 
 func printEstimateText(out io.Writer, rep report) {

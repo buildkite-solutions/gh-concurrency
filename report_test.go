@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -300,6 +301,57 @@ func TestPrintTextScopesGitHubMinuteEstimateAndConcurrency(t *testing.T) {
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("output missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestPrintTextIncludesComputeProjection(t *testing.T) {
+	small := rec(300, "linux", false)
+	small.Labels = []string{"small"}
+	large := rec(300, "linux", false)
+	large.Labels = []string{"large"}
+	rep := buildReport([]record{small, large}, config{
+		resourceMapFile: "resources.json",
+		resourceRules: []resourceRule{
+			{Name: "small", Match: resourceMatch{Labels: []string{"small"}}, Target: resourceTarget{Platform: "linux", Shape: "small", VCPUs: 2}},
+			{Name: "large", Match: resourceMatch{Labels: []string{"large"}}, Target: resourceTarget{Platform: "linux", Shape: "medium", VCPUs: 4}},
+		},
+		top: 10,
+	}, time.Second, scanSummary{}, requestStats{})
+	var out bytes.Buffer
+	printText(&out, rep)
+	text := out.String()
+	for _, want := range []string{
+		"Buildkite vCPU projection (target resource assumptions):",
+		"Coverage: 2/2 jobs (100.0%)",
+		"30.00 vCPU-min",
+		"peak     6 vCPU",
+		"linux/small (2 vCPU/job)",
+		"rule:large",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("output missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestReportJSONAddsComputeProjectionWithoutRemovingLegacyFields(t *testing.T) {
+	rep := buildReport([]record{rec(300, "linux", false)}, config{defaultVCPUs: 2}, time.Second, scanSummary{}, requestStats{})
+	body, err := json.Marshal(rep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(body)
+	for _, want := range []string{
+		`"busy_hours"`,
+		`"active_window_hours"`,
+		`"job_runtime_minutes"`,
+		`"compute_projection"`,
+		`"vcpu_minutes":10`,
+		`"peak_vcpus":2`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("JSON missing %s:\n%s", want, text)
 		}
 	}
 }
