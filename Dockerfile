@@ -32,5 +32,7 @@ COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certifica
 COPY --from=build /out/gh-concurrency /gh-concurrency
 
 USER 10001:10001
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["/gh-concurrency", "--version"]
 ENTRYPOINT ["/gh-concurrency"]
 CMD ["--help"]
